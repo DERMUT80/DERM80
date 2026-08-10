@@ -1080,7 +1080,7 @@ def build_validation_detail(analysis, swings, current_price, symbol, pair_config
         return 'Directional news signal accepted without strict entry/SL/TP enforcement.'
     pair_config = pair_config or {}
     min_dist = current_price * pair_config.get('min_dist_pct', 0.001)
-    target_rr = pair_config.get('target_rr', 1.5)
+    target_rr = pair_config.get('min_rr', pair_config.get('target_rr', 1.3))
     entry = analysis.get('entry', current_price)
     sl = analysis.get('stop_loss')
     tp_list = analysis.get('take_profit', [])
@@ -1143,64 +1143,55 @@ def apply_conservative_signal_filter(analysis, structural_context, candles, dxy_
 
 def validate_signal_math(analysis, pair_config=None):
     signal = analysis.get('signal')
+
     if signal not in ['BUY', 'SELL']:
         return False, 'Invalid signal direction.'
+
     if analysis.get('is_news_signal'):
         return True, 'Direction-only news signal accepted.'
 
     pair_config = pair_config or {}
+
     entry = analysis.get('entry')
     sl = analysis.get('stop_loss')
     tp_list = analysis.get('take_profit', [])
     tp1 = tp_list[0] if tp_list else None
 
-    current_price = entry if entry is not None else analysis.get('live_price') or analysis.get('price')
-    if current_price is None:
-        current_price = 0
+    if entry is None or sl is None or tp1 is None:
+        return False, 'Missing entry, SL, or TP values after finalization.'
 
-    if entry is None or entry == 0:
-        entry = current_price
-        analysis['entry'] = round(float(entry), 2) if entry not in [None, ''] else 0
-
-    if sl is None or tp1 is None:
-        min_dist = float(pair_config.get('min_dist_pct', 0.0015)) * float(current_price or entry or 1)
-        risk = max(min_dist, 0.5 if current_price else 0.01)
-        target_rr = float(pair_config.get('target_rr', 1.5))
-        if signal == 'BUY':
-            sl = round(float(entry) - risk, 2)
-            tp1 = round(float(entry) + (risk * target_rr), 2)
-        else:
-            sl = round(float(entry) + risk, 2)
-            tp1 = round(float(entry) - (risk * target_rr), 2)
-        analysis['stop_loss'] = sl
-        analysis['take_profit'] = [tp1]
-        analysis['levels_source'] = analysis.get('levels_source') or 'PYTHON'
-        analysis['risk_band'] = round(abs(float(entry) - float(sl)), 2)
-
-    entry = float(analysis.get('entry', entry) or 0)
-    sl = float(analysis.get('stop_loss', sl) or 0)
-    tp1 = float(analysis.get('take_profit', [tp1])[0] if analysis.get('take_profit') else tp1 or 0)
-
-    if not entry or not sl or not tp1:
-        return False, 'Missing entry, SL, or TP values.'
+    try:
+        entry = float(entry)
+        sl = float(sl)
+        tp1 = float(tp1)
+    except Exception:
+        return False, 'Entry, SL, and TP must be numeric.'
 
     if signal == 'BUY':
         if tp1 <= entry:
             return False, f'Invalid Math: For BUY, TP1 ({tp1}) MUST be > Entry ({entry}).'
         if sl >= entry:
             return False, f'Invalid Math: For BUY, SL ({sl}) MUST be < Entry ({entry}).'
+
     elif signal == 'SELL':
         if tp1 >= entry:
             return False, f'Invalid Math: For SELL, TP1 ({tp1}) MUST be < Entry ({entry}).'
         if sl <= entry:
             return False, f'Invalid Math: For SELL, SL ({sl}) MUST be > Entry ({entry}).'
 
-    min_rr = pair_config.get('target_rr', 1.0)
     risk = abs(entry - sl)
     reward = abs(entry - tp1)
-    if risk > 0 and (reward / risk) + 0.01 < min_rr:
+
+    if risk <= 0:
+        return False, 'Risk distance must be positive.'
+
+    min_rr = float(pair_config.get('min_rr', pair_config.get('target_rr', 1.3)))
+
+    if (reward / risk) + 0.01 < min_rr:
         return False, f'Invalid Math: R:R is too low ({(reward / risk):.2f}). Minimum required is 1:{min_rr:.2f}.'
+
     return True, 'Valid'
+
 
 def build_market_analysis_prompt():
     return """You are an elite institutional-style macro and execution analyst operating with the discipline of a professional trading desk. You have FULL access to the market conditions below: multi-timeframe structure (BOS/CHOCH, order blocks, FVGs, liquidity sweeps, swings), multi-timeframe RSI values and divergences, VWAP and RVOL microstructure, premium/discount range position, ATR volatility, DXY macro trend, higher-timeframe trend, and high-impact news. Use ALL of these concepts - miss nothing - and determine the current market state, the quality of the setup, and the correct directional edge yourself.
@@ -1238,6 +1229,19 @@ FIRM DESK BIAS (PYTHON, HTF-FIRST WITH HYSTERESIS):
 {firm_bias}
 MAX ENTRY DISTANCE FROM LIVE PRICE:
 {max_entry_distance}
+
+PYTHON CANDIDATE EXECUTION PLANS:
+{candidate_levels}
+
+ENTRY EXECUTION RULES:
+- Choose one executable plan from the PYTHON CANDIDATE EXECUTION PLANS when possible.
+- If you modify levels, they must remain anchored to a visible structural level such as a swing, order block, FVG, session level, VWAP, premium/discount boundary, or liquidity pool.
+- Use the ENTRY price for all SL/TP math, not the live price.
+- MARKET order: entry is approximately equal to live price.
+- LIMIT order: BUY LIMIT below live price, SELL LIMIT above live price.
+- STOP order: BUY STOP above live price, SELL STOP below live price.
+- If no valid executable plan exists within the max entry distance, output WAIT.
+- SL must be beyond the stated stop_anchor and TP must respect the stated tp_anchor.
 ═══════════════════════════════════════════════════════════════════════════════
 MANDATORY ANALYSIS RULES:
 ═══════════════════════════════════════════════════════════════════════════════
@@ -1278,6 +1282,10 @@ OUTPUT JSON ONLY (NO MARKDOWN):
     "take_profit": [0.00, 0.00],
     "rr_ratio": 0.00,
     "order_type": "MARKET|LIMIT|STOP|NONE",
+    "entry_anchor": "demand zone / swing low / FVG / VWAP / session low",
+    "stop_anchor": "swing low / order block low / FVG bottom / invalidation level",
+    "tp_anchor": "swing high / supply zone / FVG top / session high",
+    "order_expiry": "until next H1 close / until structure invalidates / good till cancelled",
     "order_description": "Brief execution plan using the SAME numbers as entry/stop_loss/take_profit.",
     "confluence_breakdown": "A short explanation of the weighting behind the score using DXY, RSI, VWAP, RVOL, structure, premium/discount, and market phase.",
     "reasoning": "A detailed, confident, pair-specific institutional brief (min 120 words) showing HTF structure, manipulation reads, divergences, DXY, volatility, and exact invalidation/target logic.",
@@ -1531,28 +1539,102 @@ def build_telegram_signal_message(symbol, result):
     tp_value = tp_values[0] if tp_values else 'N/A'
     score = result.get('confluence_score', 0)
     event_time = result.get('news_time') or 'now'
+
     signal = normalize_ai_signal(result.get('signal'))
     signal = _escape_telegram_html(signal)
+
     reasoning = _escape_telegram_html(result.get('reasoning'))
-    return (f"🌍 <b>DER-AI MACRO SIGNAL</b>\n"
-            f"📊 <b>{_escape_telegram_html(symbol)}</b> - {signal}\n"
-            f"🗂️ Event: Live market Analysis\n"
-            f"⏰ Time: {_escape_telegram_html(event_time)}\n"
-            f"📈 Score: {score}/100\n"
-            f"💰 Entry: {_escape_telegram_html(result.get('entry'))} | 🛑 SL: {_escape_telegram_html(result.get('stop_loss'))} | 🎯 TP: {_escape_telegram_html(tp_value)}\n"
-            f"📈 DXY: {_escape_telegram_html(result.get('dxy_correlation'))}\n"
-            f"🧠 {reasoning}")
+    order_type = _escape_telegram_html(result.get('order_type', 'MARKET'))
+
+    return (
+        f"🌍 <b>DER-AI MACRO SIGNAL</b>\n"
+        f"📊 <b>{_escape_telegram_html(symbol)}</b> - {signal}\n"
+        f"🗂️ Event: Live market Analysis\n"
+        f"⏰ Time: {_escape_telegram_html(event_time)}\n"
+        f"📈 Score: {score}/100\n"
+        f"🧾 Order: {order_type}\n"
+        f"💰 Entry: {_escape_telegram_html(result.get('entry'))} | 🛑 SL: {_escape_telegram_html(result.get('stop_loss'))} | 🎯 TP: {_escape_telegram_html(tp_value)}\n"
+        f"📈 DXY: {_escape_telegram_html(result.get('dxy_correlation'))}\n"
+        f"🧠 {reasoning}"
+    )
+
 
 # ── Pair-Specific Configuration & Structural Scoring ─────────────────────────
 # FIX: cooldown 10 -> 30 so a good setup is not re-signalled every cycle.
 def get_pair_config(symbol):
-    configs = {
-        'XAUUSD': {'min_dist_pct': 0.0015, 'max_risk_pct': 0.008, 'target_rr': 1.0, 'score_floor': MINIMUM_CONFLUENCE_SCORE, 'candidate_score': MINIMUM_CONFLUENCE_SCORE, 'cooldown_minutes': 30, 'max_entry_gap_pct': 0.003, 'max_entry_points': 10},
-        'EURUSD': {'min_dist_pct': 0.0005, 'max_risk_pct': 0.003, 'target_rr': 1.0, 'score_floor': MINIMUM_CONFLUENCE_SCORE, 'candidate_score': MINIMUM_CONFLUENCE_SCORE, 'cooldown_minutes': 30, 'max_entry_gap_pct': 0.002, 'max_entry_points': 0.0025},
-        'BTCUSD': {'min_dist_pct': 0.004, 'max_risk_pct': 0.012, 'target_rr': 1.0, 'score_floor': MINIMUM_CONFLUENCE_SCORE, 'candidate_score': MINIMUM_CONFLUENCE_SCORE, 'cooldown_minutes': 30, 'max_entry_gap_pct': 0.004, 'max_entry_points': 150},
-        'US30': {'min_dist_pct': 0.003, 'max_risk_pct': 0.008, 'target_rr': 1.0, 'score_floor': MINIMUM_CONFLUENCE_SCORE, 'candidate_score': MINIMUM_CONFLUENCE_SCORE, 'cooldown_minutes': 30, 'max_entry_gap_pct': 0.003, 'max_entry_points': 120},
+    base = {
+        'digits': 2,
+        'tick_size': 0.01,
+
+        'min_dist_pct': 0.0015,
+        'max_risk_pct': 0.008,
+
+        'min_rr': 1.3,
+        'target_rr': 1.6,
+
+        'score_floor': MINIMUM_CONFLUENCE_SCORE,
+        'candidate_score': MINIMUM_CONFLUENCE_SCORE,
+        'cooldown_minutes': 30,
+
+        'max_entry_gap_pct': 0.0025,
+        'max_entry_points': 10,
+
+        'min_stop_atr': 0.8,
+        'max_stop_atr': 3.0,
+
+        'stop_buffer_atr': 0.20,
+        'tp_buffer_atr': 0.12,
+
+        'market_zone_atr': 0.20,
+        'limit_zone_atr': 0.90,
+        'stop_zone_atr': 0.90,
+
+        'spread_multiplier': 1.5,
     }
-    return configs.get(symbol, {'min_dist_pct': 0.001, 'max_risk_pct': 0.008, 'target_rr': 1.0, 'score_floor': MINIMUM_CONFLUENCE_SCORE, 'candidate_score': MINIMUM_CONFLUENCE_SCORE, 'cooldown_minutes': 30, 'max_entry_gap_pct': 0.003, 'max_entry_points': 10})
+
+    overrides = {
+        'XAUUSD': {
+            'digits': 2,
+            'tick_size': 0.01,
+            'min_dist_pct': 0.0015,
+            'max_risk_pct': 0.008,
+            'max_entry_gap_pct': 0.003,
+            'max_entry_points': 10,
+            'target_rr': 1.6,
+        },
+        'EURUSD': {
+            'digits': 5,
+            'tick_size': 0.00001,
+            'min_dist_pct': 0.0005,
+            'max_risk_pct': 0.003,
+            'max_entry_gap_pct': 0.002,
+            'max_entry_points': 0.0025,
+            'target_rr': 1.5,
+            'max_stop_atr': 2.5,
+        },
+        'BTCUSD': {
+            'digits': 2,
+            'tick_size': 0.01,
+            'min_dist_pct': 0.004,
+            'max_risk_pct': 0.012,
+            'max_entry_gap_pct': 0.004,
+            'max_entry_points': 150,
+            'target_rr': 1.8,
+            'max_stop_atr': 3.5,
+        },
+        'US30': {
+            'digits': 1,
+            'tick_size': 0.1,
+            'min_dist_pct': 0.003,
+            'max_risk_pct': 0.008,
+            'max_entry_gap_pct': 0.003,
+            'max_entry_points': 120,
+            'target_rr': 1.5,
+        },
+    }
+
+    return {**base, **overrides.get(symbol, {})}
+
 
 def calculate_structural_score(df, symbol, dxy_context=None, news_context=None, phase_context=None):
     if df.empty or len(df) < 10:
@@ -2281,6 +2363,675 @@ def call_gpt(system_prompt, user_content, max_tokens=2000, retry_count=0, estima
     return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "Error: all Gemini models failed.", "estimated_tokens": estimated_tokens}
 
 # ── Level Enforcement ─────────────────────────────────────────────────────────
+def round_price(price, pair_config):
+    try:
+        if price is None:
+            return None
+        return round(float(price), int(pair_config.get('digits', 2)))
+    except Exception:
+        return None
+
+
+def infer_order_type(signal, entry, current_price, pair_config, atr=None):
+    if signal not in ('BUY', 'SELL') or entry is None or current_price is None:
+        return 'MARKET'
+
+    try:
+        entry = float(entry)
+        current_price = float(current_price)
+    except Exception:
+        return 'MARKET'
+
+    tick = float(pair_config.get('tick_size', 0.01) or 0.01)
+    market_tolerance = max(
+        tick * 3.0,
+        float(atr or 0.0) * float(pair_config.get('market_zone_atr', 0.20))
+    )
+
+    if abs(entry - current_price) <= market_tolerance:
+        return 'MARKET'
+
+    if signal == 'BUY':
+        return 'LIMIT' if entry < current_price else 'STOP'
+
+    return 'LIMIT' if entry > current_price else 'STOP'
+
+
+def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair_config):
+    try:
+        entry = float(entry)
+        sl = float(sl)
+        tp = float(tp)
+        current_price = float(current_price)
+    except Exception:
+        return False, "Missing or non-numeric entry/SL/TP."
+
+    if entry <= 0 or sl <= 0 or tp <= 0 or current_price <= 0:
+        return False, "Entry, SL, TP, and current price must be positive."
+
+    max_entry_gap = min(
+        float(pair_config.get('max_entry_points', 10) or 10),
+        current_price * float(pair_config.get('max_entry_gap_pct', 0.003) or 0.003)
+    )
+
+    if atr:
+        max_entry_gap = min(max_entry_gap, float(atr) * float(pair_config.get('limit_zone_atr', 1.0)))
+
+    if abs(entry - current_price) > max_entry_gap:
+        return False, f"Entry too far from live price. Gap={abs(entry - current_price):.6f}, max={max_entry_gap:.6f}."
+
+    order_type = str(order_type or '').upper()
+
+    if order_type == 'LIMIT':
+        if signal == 'BUY' and entry >= current_price:
+            return False, "BUY LIMIT must be below current price."
+        if signal == 'SELL' and entry <= current_price:
+            return False, "SELL LIMIT must be above current price."
+
+    if order_type == 'STOP':
+        if signal == 'BUY' and entry <= current_price:
+            return False, "BUY STOP must be above current price."
+        if signal == 'SELL' and entry >= current_price:
+            return False, "SELL STOP must be below current price."
+
+    min_stop_distance = max(
+        abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
+        float(atr or 0.0) * float(pair_config.get('min_stop_atr', 0.8))
+    )
+
+    max_stop_price = abs(entry) * float(pair_config.get('max_risk_pct', 0.008))
+
+    if atr:
+        max_stop_distance = min(max_stop_price, float(atr) * float(pair_config.get('max_stop_atr', 3.0)))
+    else:
+        max_stop_distance = max_stop_price
+
+    if signal == 'BUY':
+        if sl >= entry:
+            return False, f"BUY SL must be below entry. SL={sl}, entry={entry}."
+        if tp <= entry:
+            return False, f"BUY TP must be above entry. TP={tp}, entry={entry}."
+
+        risk = entry - sl
+        reward = tp - entry
+
+    elif signal == 'SELL':
+        if sl <= entry:
+            return False, f"SELL SL must be above entry. SL={sl}, entry={entry}."
+        if tp >= entry:
+            return False, f"SELL TP must be below entry. TP={tp}, entry={entry}."
+
+        risk = sl - entry
+        reward = entry - tp
+
+    else:
+        return False, "Invalid signal."
+
+    if risk <= 0:
+        return False, "Risk distance must be positive."
+
+    if risk < min_stop_distance * 0.95:
+        return False, f"Stop too tight. Risk={risk:.6f}, min={min_stop_distance:.6f}."
+
+    if risk > max_stop_distance * 1.05:
+        return False, f"Stop too wide. Risk={risk:.6f}, max={max_stop_distance:.6f}."
+
+    rr = reward / risk if risk > 0 else 0
+    min_rr = float(pair_config.get('min_rr', pair_config.get('target_rr', 1.3)))
+
+    if rr + 0.01 < min_rr:
+        return False, f"RR too low. RR={rr:.2f}, min={min_rr:.2f}."
+
+    return True, "Valid"
+
+
+def get_entry_anchor(signal, current_price, swings, order_blocks, fvgs):
+    try:
+        current_price = float(current_price)
+    except Exception:
+        return None
+
+    candidates = []
+
+    try:
+        if signal == 'BUY':
+            candidates.extend([
+                float(x)
+                for x in (swings or {}).get('recent_swing_lows', [])
+                if x and float(x) < current_price
+            ])
+
+            candidates.extend([
+                float(ob.get('price'))
+                for ob in (order_blocks or [])
+                if ob.get('type') == 'BULLISH_OB' and float(ob.get('price', 0) or 0) < current_price
+            ])
+
+            candidates.extend([
+                float(fvg.get('bottom'))
+                for fvg in (fvgs or [])
+                if fvg.get('type') == 'BULLISH_FVG' and float(fvg.get('bottom', 0) or 0) < current_price
+            ])
+
+            return max(candidates) if candidates else None
+
+        if signal == 'SELL':
+            candidates.extend([
+                float(x)
+                for x in (swings or {}).get('recent_swing_highs', [])
+                if x and float(x) > current_price
+            ])
+
+            candidates.extend([
+                float(ob.get('price'))
+                for ob in (order_blocks or [])
+                if ob.get('type') == 'BEARISH_OB' and float(ob.get('price', 0) or 0) > current_price
+            ])
+
+            candidates.extend([
+                float(fvg.get('top'))
+                for fvg in (fvgs or [])
+                if fvg.get('type') == 'BEARISH_FVG' and float(fvg.get('top', 0) or 0) > current_price
+            ])
+
+            return min(candidates) if candidates else None
+
+    except Exception:
+        return None
+
+    return None
+
+
+def get_stop_trigger_anchor(signal, current_price, swings):
+    try:
+        current_price = float(current_price)
+
+        if signal == 'BUY':
+            levels = [
+                float(x)
+                for x in (swings or {}).get('recent_swing_highs', [])
+                if x and float(x) > current_price
+            ]
+            return min(levels) if levels else None
+
+        if signal == 'SELL':
+            levels = [
+                float(x)
+                for x in (swings or {}).get('recent_swing_lows', [])
+                if x and float(x) < current_price
+            ]
+            return max(levels) if levels else None
+
+    except Exception:
+        return None
+
+    return None
+
+
+def get_structural_anchors(signal, entry, swings, order_blocks, fvgs):
+    try:
+        entry = float(entry)
+    except Exception:
+        return None, None
+
+    swing_highs = []
+    swing_lows = []
+
+    try:
+        swing_highs = [float(x) for x in (swings or {}).get('recent_swing_highs', []) if x]
+        swing_lows = [float(x) for x in (swings or {}).get('recent_swing_lows', []) if x]
+    except Exception:
+        pass
+
+    order_blocks = order_blocks or []
+    fvgs = fvgs or []
+
+    try:
+        if signal == 'BUY':
+            sl_candidates = []
+            sl_candidates.extend([x for x in swing_lows if x < entry])
+
+            sl_candidates.extend([
+                float(ob.get('price'))
+                for ob in order_blocks
+                if ob.get('type') == 'BULLISH_OB' and float(ob.get('price', 0) or 0) < entry
+            ])
+
+            sl_candidates.extend([
+                float(fvg.get('bottom'))
+                for fvg in fvgs
+                if fvg.get('type') == 'BULLISH_FVG' and float(fvg.get('bottom', 0) or 0) < entry
+            ])
+
+            tp_candidates = []
+            tp_candidates.extend([x for x in swing_highs if x > entry])
+
+            tp_candidates.extend([
+                float(ob.get('price'))
+                for ob in order_blocks
+                if ob.get('type') == 'BEARISH_OB' and float(ob.get('price', 0) or 0) > entry
+            ])
+
+            tp_candidates.extend([
+                float(fvg.get('top'))
+                for fvg in fvgs
+                if fvg.get('type') == 'BEARISH_FVG' and float(fvg.get('top', 0) or 0) > entry
+            ])
+
+            sl_anchor = max(sl_candidates) if sl_candidates else None
+            tp_anchor = min(tp_candidates) if tp_candidates else None
+
+            return sl_anchor, tp_anchor
+
+        if signal == 'SELL':
+            sl_candidates = []
+            sl_candidates.extend([x for x in swing_highs if x > entry])
+
+            sl_candidates.extend([
+                float(ob.get('price'))
+                for ob in order_blocks
+                if ob.get('type') == 'BEARISH_OB' and float(ob.get('price', 0) or 0) > entry
+            ])
+
+            sl_candidates.extend([
+                float(fvg.get('top'))
+                for fvg in fvgs
+                if fvg.get('type') == 'BEARISH_FVG' and float(fvg.get('top', 0) or 0) > entry
+            ])
+
+            tp_candidates = []
+            tp_candidates.extend([x for x in swing_lows if x < entry])
+
+            tp_candidates.extend([
+                float(ob.get('price'))
+                for ob in order_blocks
+                if ob.get('type') == 'BULLISH_OB' and float(ob.get('price', 0) or 0) < entry
+            ])
+
+            tp_candidates.extend([
+                float(fvg.get('bottom'))
+                for fvg in fvgs
+                if fvg.get('type') == 'BULLISH_FVG' and float(fvg.get('bottom', 0) or 0) < entry
+            ])
+
+            sl_anchor = min(sl_candidates) if sl_candidates else None
+            tp_anchor = max(tp_candidates) if tp_candidates else None
+
+            return sl_anchor, tp_anchor
+
+    except Exception:
+        return None, None
+
+    return None, None
+
+
+def build_structural_plan_v2(signal, entry, current_price, swings, order_blocks, fvgs, atr, pair_config):
+    try:
+        entry = float(entry)
+        current_price = float(current_price)
+    except Exception:
+        return None
+
+    if signal not in ('BUY', 'SELL'):
+        return None
+
+    tick = float(pair_config.get('tick_size', 0.01) or 0.01)
+
+    if atr is None or float(atr) <= 0:
+        atr = abs(entry) * float(pair_config.get('min_dist_pct', 0.0015))
+
+    atr = float(atr)
+
+    stop_buffer = max(
+        atr * float(pair_config.get('stop_buffer_atr', 0.20)),
+        tick * 3.0
+    )
+
+    tp_buffer = max(
+        atr * float(pair_config.get('tp_buffer_atr', 0.12)),
+        tick * 2.0
+    )
+
+    min_stop_distance = max(
+        abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
+        atr * float(pair_config.get('min_stop_atr', 0.8))
+    )
+
+    max_stop_price = abs(entry) * float(pair_config.get('max_risk_pct', 0.008))
+    max_stop_distance = min(max_stop_price, atr * float(pair_config.get('max_stop_atr', 3.0)))
+
+    sl_anchor, tp_anchor = get_structural_anchors(signal, entry, swings, order_blocks, fvgs)
+
+    target_rr = float(pair_config.get('target_rr', 1.6))
+    min_rr = float(pair_config.get('min_rr', 1.3))
+
+    if signal == 'BUY':
+        if sl_anchor is not None:
+            sl = sl_anchor - stop_buffer
+        else:
+            sl = entry - min_stop_distance
+
+        risk = entry - sl
+
+        if risk < min_stop_distance:
+            sl = entry - min_stop_distance
+            risk = min_stop_distance
+
+        if risk > max_stop_distance:
+            sl = entry - max_stop_distance
+            risk = max_stop_distance
+
+        if risk <= 0:
+            return None
+
+        rr_target = entry + risk * target_rr
+        structure_target = (tp_anchor - tp_buffer) if tp_anchor is not None else rr_target
+
+        tp = None
+
+        if structure_target > entry:
+            structure_rr = (structure_target - entry) / risk
+            if structure_rr >= min_rr:
+                tp = structure_target
+
+        if tp is None and rr_target > entry:
+            if tp_anchor is None or rr_target <= tp_anchor:
+                rr = (rr_target - entry) / risk
+                if rr >= min_rr:
+                    tp = rr_target
+
+        if tp is None:
+            tp = entry + risk * max(target_rr, min_rr)
+
+        if (tp - entry) / risk < min_rr:
+            tp = entry + risk * min_rr
+
+        order_type = infer_order_type(signal, entry, current_price, pair_config, atr)
+        rr = round((tp - entry) / risk, 2) if risk > 0 else 0
+
+        return {
+            'entry': round_price(entry, pair_config),
+            'stop_loss': round_price(sl, pair_config),
+            'take_profit': [round_price(tp, pair_config)],
+            'rr_ratio': rr,
+            'risk_band': round_price(risk, pair_config),
+            'order_type': order_type,
+            'levels_source': 'PYTHON',
+        }
+
+    if signal == 'SELL':
+        if sl_anchor is not None:
+            sl = sl_anchor + stop_buffer
+        else:
+            sl = entry + min_stop_distance
+
+        risk = sl - entry
+
+        if risk < min_stop_distance:
+            sl = entry + min_stop_distance
+            risk = min_stop_distance
+
+        if risk > max_stop_distance:
+            sl = entry + max_stop_distance
+            risk = max_stop_distance
+
+        if risk <= 0:
+            return None
+
+        rr_target = entry - risk * target_rr
+        structure_target = (tp_anchor + tp_buffer) if tp_anchor is not None else rr_target
+
+        tp = None
+
+        if structure_target < entry:
+            structure_rr = (entry - structure_target) / risk
+            if structure_rr >= min_rr:
+                tp = structure_target
+
+        if tp is None and rr_target < entry:
+            if tp_anchor is None or rr_target >= tp_anchor:
+                rr = (entry - rr_target) / risk
+                if rr >= min_rr:
+                    tp = rr_target
+
+        if tp is None:
+            tp = entry - risk * max(target_rr, min_rr)
+
+        if (entry - tp) / risk < min_rr:
+            tp = entry - risk * min_rr
+
+        order_type = infer_order_type(signal, entry, current_price, pair_config, atr)
+        rr = round((entry - tp) / risk, 2) if risk > 0 else 0
+
+        return {
+            'entry': round_price(entry, pair_config),
+            'stop_loss': round_price(sl, pair_config),
+            'take_profit': [round_price(tp, pair_config)],
+            'rr_ratio': rr,
+            'risk_band': round_price(risk, pair_config),
+            'order_type': order_type,
+            'levels_source': 'PYTHON',
+        }
+
+    return None
+
+
+def build_candidate_levels(symbol, current_price, swings, order_blocks, fvgs, atr, pair_config):
+    plans = []
+
+    try:
+        current_price = float(current_price)
+    except Exception:
+        return plans
+
+    max_gap = min(
+        float(pair_config.get('max_entry_points', 10) or 10),
+        current_price * float(pair_config.get('max_entry_gap_pct', 0.003) or 0.003)
+    )
+
+    if atr:
+        max_gap = min(max_gap, float(atr) * float(pair_config.get('limit_zone_atr', 1.0)))
+
+    for signal in ('BUY', 'SELL'):
+        market_plan = build_structural_plan_v2(
+            signal=signal,
+            entry=current_price,
+            current_price=current_price,
+            swings=swings,
+            order_blocks=order_blocks,
+            fvgs=fvgs,
+            atr=atr,
+            pair_config=pair_config
+        )
+
+        if market_plan:
+            market_plan['plan'] = 'MARKET'
+            market_plan['signal'] = signal
+            plans.append(market_plan)
+
+        limit_entry = get_entry_anchor(signal, current_price, swings, order_blocks, fvgs)
+
+        if limit_entry is not None and abs(limit_entry - current_price) <= max_gap:
+            limit_plan = build_structural_plan_v2(
+                signal=signal,
+                entry=limit_entry,
+                current_price=current_price,
+                swings=swings,
+                order_blocks=order_blocks,
+                fvgs=fvgs,
+                atr=atr,
+                pair_config=pair_config
+            )
+
+            if limit_plan:
+                limit_plan['plan'] = 'LIMIT'
+                limit_plan['signal'] = signal
+                plans.append(limit_plan)
+
+        stop_entry = get_stop_trigger_anchor(signal, current_price, swings)
+
+        if stop_entry is not None and abs(stop_entry - current_price) <= max_gap:
+            stop_plan = build_structural_plan_v2(
+                signal=signal,
+                entry=stop_entry,
+                current_price=current_price,
+                swings=swings,
+                order_blocks=order_blocks,
+                fvgs=fvgs,
+                atr=atr,
+                pair_config=pair_config
+            )
+
+            if stop_plan:
+                stop_plan['plan'] = 'STOP'
+                stop_plan['signal'] = signal
+                plans.append(stop_plan)
+
+    return plans
+
+
+def finalize_trade_plan(
+    analysis,
+    symbol,
+    current_price,
+    swings,
+    order_blocks,
+    fvgs,
+    atr,
+    pair_config
+):
+    if not isinstance(analysis, dict):
+        return analysis
+
+    signal = analysis.get('signal')
+
+    if signal not in ('BUY', 'SELL'):
+        return analysis
+
+    if analysis.get('is_news_signal'):
+        return analysis
+
+    try:
+        current_price = float(current_price)
+    except Exception:
+        return analysis
+
+    entry = analysis.get('entry')
+
+    try:
+        entry = float(entry)
+    except Exception:
+        entry = None
+
+    max_entry_gap = min(
+        float(pair_config.get('max_entry_points', 10) or 10),
+        current_price * float(pair_config.get('max_entry_gap_pct', 0.003) or 0.003)
+    )
+
+    if atr:
+        max_entry_gap = min(max_entry_gap, float(atr) * float(pair_config.get('limit_zone_atr', 1.0)))
+
+    if entry is None or entry <= 0 or abs(entry - current_price) > max_entry_gap:
+        entry = current_price
+        analysis['order_type'] = 'MARKET'
+        analysis['levels_source'] = 'PYTHON'
+        analysis['reasoning'] = (
+            f"{analysis.get('reasoning', '')} "
+            "Entry was re-anchored to live price because the proposed entry was missing, invalid, or too far from market."
+        ).strip()
+
+    inferred_order_type = infer_order_type(signal, entry, current_price, pair_config, atr)
+    requested_order_type = str(analysis.get('order_type') or '').upper()
+
+    if requested_order_type not in ('MARKET', 'LIMIT', 'STOP') or requested_order_type != inferred_order_type:
+        analysis['order_type'] = inferred_order_type
+
+    analysis['entry'] = round_price(entry, pair_config)
+
+    sl = analysis.get('stop_loss')
+    tp_list = analysis.get('take_profit', [])
+    tp = tp_list[0] if tp_list else None
+
+    ok, reason = check_level_math(
+        signal=signal,
+        order_type=analysis.get('order_type'),
+        entry=entry,
+        sl=sl,
+        tp=tp,
+        current_price=current_price,
+        atr=atr,
+        pair_config=pair_config
+    )
+
+    if not ok:
+        plan = build_structural_plan_v2(
+            signal=signal,
+            entry=entry,
+            current_price=current_price,
+            swings=swings,
+            order_blocks=order_blocks,
+            fvgs=fvgs,
+            atr=atr,
+            pair_config=pair_config
+        )
+
+        if not plan:
+            analysis['signal'] = 'WAIT'
+            analysis['confidence'] = 'LOW'
+            analysis['rejection_reason'] = f"No executable structural plan. Level check failed: {reason}"
+            return analysis
+
+        analysis.update(plan)
+
+    analysis['entry'] = round_price(analysis.get('entry'), pair_config)
+    analysis['stop_loss'] = round_price(analysis.get('stop_loss'), pair_config)
+
+    if analysis.get('take_profit'):
+        analysis['take_profit'] = [
+            round_price(x, pair_config)
+            for x in analysis.get('take_profit')
+            if x is not None
+        ]
+
+    final_entry = analysis.get('entry')
+    final_sl = analysis.get('stop_loss')
+    final_tp = (analysis.get('take_profit') or [None])[0]
+
+    ok_final, reason_final = check_level_math(
+        signal=analysis.get('signal'),
+        order_type=analysis.get('order_type'),
+        entry=final_entry,
+        sl=final_sl,
+        tp=final_tp,
+        current_price=current_price,
+        atr=atr,
+        pair_config=pair_config
+    )
+
+    if not ok_final:
+        analysis['signal'] = 'WAIT'
+        analysis['confidence'] = 'LOW'
+        analysis['rejection_reason'] = f"Final level validation failed: {reason_final}"
+        return analysis
+
+    entry_f = float(analysis['entry'])
+    sl_f = float(analysis['stop_loss'])
+    tp_f = float(analysis['take_profit'][0])
+
+    if analysis['signal'] == 'BUY':
+        risk = entry_f - sl_f
+        reward = tp_f - entry_f
+    else:
+        risk = sl_f - entry_f
+        reward = entry_f - tp_f
+
+    analysis['rr_ratio'] = round(reward / risk, 2) if risk > 0 else 0
+    analysis['risk_band'] = round_price(risk, pair_config)
+    analysis.setdefault('levels_source', 'HYBRID')
+
+    return analysis
+
+
 def enforce_structural_math(analysis, swings, current_price, symbol, pair_config=None, atr=None):
     signal = analysis.get('signal')
     if signal not in ['BUY', 'SELL']:
@@ -2673,6 +3424,7 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         structural_score_context = f"Python structural score: {structural_context['structural_score']}/100 | Basis: {structural_context['score_reason']}"
         historical_context = build_historical_context(m10)
         firm_bias_text = f"{firm} (standing desk bias; weighted MTF evidence {picture.get('score', 0):+.1f})" if firm else "NONE - evidence tied; stand aside unless a clear edge emerges."
+        candidate_levels = build_candidate_levels(symbol, current_price, swings, order_blocks, fvgs, setup_context.get('atr'), pair_config)
         all_format_kwargs = {
             'data_summary': prompt_data, 'microstructure_data': prompt_micro,
             'structure_context': structure_context, 'market_structure_summary': market_structure_summary,
@@ -2683,6 +3435,7 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
             'news_summary': news_text, 'structural_score_context': structural_score_context,
             'directional_ledger': directional_ledger, 'firm_bias': firm_bias_text,
             'max_entry_distance': max_entry_distance,
+            'candidate_levels': json.dumps(candidate_levels, indent=2, default=str),
         }
 
         try:
@@ -2695,6 +3448,10 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         # the news/market analysis rules as authoritative system-level behavior.
         estimated_tokens = estimate_analysis_tokens(prompt_template, user_content)
         analysis = call_gpt(prompt_template, user_content, max_tokens=2000, estimated_tokens=estimated_tokens)
+        # Refresh executable quote after AI latency before final level enforcement.
+        _post_ai_snapshot = get_live_market_snapshot(symbol, YFINANCE_MAP.get(symbol, symbol), fallback_df=m10)
+        if _post_ai_snapshot.get("price"):
+            current_price = _post_ai_snapshot.get("price")
         analysis = normalize_analysis_signals(analysis)
         analysis.setdefault('microstructure_read', prompt_micro)
         analysis.setdefault('rsi_context', rsi_context)
@@ -2740,7 +3497,7 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
             analysis['confluence_score'] = min(analysis.get('confluence_score', 0), MINIMUM_CONFLUENCE_SCORE)
             analysis['rejection_reason'] = 'The entry is already late, the move is in progress, and the structure is no longer offering a clean early re-entry opportunity.'
         analysis = apply_htf_trend_guard(analysis, symbol, htf_context)
-        analysis = enforce_live_entry_proximity(analysis, current_price, symbol, pair_config=pair_config, swings=swings)
+        # Entry proximity and order type are handled after direction guards by finalize_trade_plan.
         ai_score = int(round(analysis.get('confluence_score', 0)))
         analysis['confluence_score'] = min(100, max(0, ai_score))
         if analysis.get('confidence') == 'LOW' and analysis['confluence_score'] >= 75:
@@ -2768,19 +3525,16 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
                 analysis['signal'] = firm_norm
                 analysis['reasoning'] = (analysis.get('reasoning') or '') + f" The standing {firm_norm} desk bias is maintained; the AI view was aligned to the desk bias."
         analysis = apply_conservative_signal_filter(analysis, structural_context, candles, dxy_context, news_context, current_price, swings, symbol, pair_config=pair_config)
-        analysis = enforce_structural_math(analysis, swings, current_price, symbol, pair_config=pair_config, atr=setup_context.get('atr'))
-        if analysis.get('signal') in ('BUY', 'SELL') and (not analysis.get('stop_loss') or not analysis.get('take_profit')):
-            execution_plan = build_execution_plan(m10, current_price, analysis.get('signal'), swings, pair_config=pair_config, atr=setup_context.get('atr'))
-            analysis['entry'] = execution_plan['entry']
-            analysis['stop_loss'] = execution_plan['stop_loss']
-            analysis['take_profit'] = execution_plan['take_profit']
-            analysis['risk_band'] = execution_plan['risk_band']
-            analysis['levels_source'] = 'PYTHON'
-        else:
-            analysis['risk_band'] = round(abs(analysis.get('entry', 0) - analysis.get('stop_loss', 0)), 2)
-        if not news_override:
-            analysis = normalize_market_levels(analysis, current_price, symbol, pair_config=pair_config)
-        analysis = enforce_max_entry_distance(analysis, current_price, symbol, pair_config=pair_config)
+        analysis = finalize_trade_plan(
+            analysis=analysis,
+            symbol=symbol,
+            current_price=current_price,
+            swings=swings,
+            order_blocks=order_blocks,
+            fvgs=fvgs,
+            atr=setup_context.get('atr'),
+            pair_config=pair_config
+        )
         if analysis.get('signal') in ('BUY', 'SELL') and analysis.get('take_profit'):
             final_note = f"Final levels: Entry {analysis['entry']} | SL {analysis['stop_loss']} | TP {analysis['take_profit'][0]}."
             analysis['order_description'] = f"{final_note} {analysis.get('order_description') or ''}".strip()
@@ -3007,27 +3761,80 @@ with tab1:
             load_market_data(force_refresh=True)
     status_placeholder = st.empty()
     render_analysis_status(status_placeholder)
-    def _local_fallback(symbol, all_data):
-        m10_local = all_data.get(symbol, {}).get('M10', pd.DataFrame())
-        if not m10_local.empty:
-            swings_local = find_swings(m10_local)
-            pair_config_local = get_pair_config(symbol)
-            dxy_data_local = all_data.get('DXY', {}).get('H1', pd.DataFrame())
-            dxy_context_local = None
-            if not dxy_data_local.empty:
-                dxy_micro_local = calculate_microstructure(dxy_data_local)
-                dxy_context_local = {'trend': dxy_micro_local['momentum'], 'price_vs_vwap': dxy_micro_local['price_vs_vwap']}
-            h4_local = all_data.get(symbol, {}).get('H4', pd.DataFrame())
-            htf_local = None
-            if not h4_local.empty:
-                h4_micro_local = calculate_microstructure(h4_local)
-                htf_local = {'trend': h4_micro_local['momentum'], 'bias': h4_micro_local['momentum']}
-            pic_local = build_mtf_picture(all_data, symbol)
-            firm_local, firm_notes_local = resolve_firm_direction(symbol, pic_local)
-            learn_local = learning_note(symbol)
-            historical_context_local = build_historical_context(m10_local)
-            return build_market_fallback_analysis(symbol, m10_local, swings_local, pair_config_local, dxy_context_local, {'within_2h': False}, htf_context=htf_local, picture=pic_local, firm=firm_local, firm_notes=firm_notes_local, learning=learn_local, historical_context=historical_context_local)
-        return {'signal': 'WAIT', 'confidence': 'LOW', 'confluence_score': MINIMUM_CONFLUENCE_SCORE, 'rejection_reason': 'Data unavailable for fallback'}
+def _local_fallback(symbol, all_data):
+    m10_local = all_data.get(symbol, {}).get('M10', pd.DataFrame())
+
+    if not m10_local.empty:
+        swings_local = find_swings(m10_local)
+        pair_config_local = get_pair_config(symbol)
+
+        dxy_data_local = all_data.get('DXY', {}).get('H1', pd.DataFrame())
+        dxy_context_local = None
+
+        if not dxy_data_local.empty:
+            dxy_micro_local = calculate_microstructure(dxy_data_local)
+            dxy_context_local = {
+                'trend': dxy_micro_local['momentum'],
+                'price_vs_vwap': dxy_micro_local['price_vs_vwap']
+            }
+
+        h4_local = all_data.get(symbol, {}).get('H4', pd.DataFrame())
+        htf_local = None
+
+        if not h4_local.empty:
+            h4_micro_local = calculate_microstructure(h4_local)
+            htf_local = {
+                'trend': h4_micro_local['momentum'],
+                'bias': h4_micro_local['momentum']
+            }
+
+        pic_local = build_mtf_picture(all_data, symbol)
+        firm_local, firm_notes_local = resolve_firm_direction(symbol, pic_local)
+        learn_local = learning_note(symbol)
+        historical_context_local = build_historical_context(m10_local)
+
+        result = build_market_fallback_analysis(
+            symbol,
+            m10_local,
+            swings_local,
+            pair_config_local,
+            dxy_context_local,
+            {'within_2h': False},
+            htf_context=htf_local,
+            picture=pic_local,
+            firm=firm_local,
+            firm_notes=firm_notes_local,
+            learning=learn_local,
+            historical_context=historical_context_local
+        )
+
+        if result.get('signal') in ('BUY', 'SELL'):
+            live_local = get_live_market_snapshot(
+                symbol,
+                YFINANCE_MAP.get(symbol, symbol),
+                fallback_df=m10_local
+            ).get('price') or float(m10_local['Close'].iloc[-1])
+
+            result = finalize_trade_plan(
+                analysis=result,
+                symbol=symbol,
+                current_price=live_local,
+                swings=swings_local,
+                order_blocks=detect_order_blocks(m10_local),
+                fvgs=detect_fvg(m10_local),
+                atr=calculate_atr(m10_local),
+                pair_config=pair_config_local
+            )
+
+        return result
+
+    return {
+        'signal': 'WAIT',
+        'confidence': 'LOW',
+        'confluence_score': MINIMUM_CONFLUENCE_SCORE,
+        'rejection_reason': 'Data unavailable for fallback'
+    }
+
     if st.button("🔍 Run Macro Analysis Now", type="secondary", disabled=st.session_state.bot_running):
         try:
             if is_gpt_rate_limited():
