@@ -2373,7 +2373,7 @@ NEWS_ANALYSIS_PROMPT = build_news_analysis_prompt()
 
 def call_gpt(system_prompt, user_content, max_tokens=2000, retry_count=0, estimated_tokens=None):
     api_key = get_secret("GEMINI_API_KEY", "")
-    if not api_key or not api_key.startswith("AIza"):
+    if not api_key or not (api_key.startswith("AIza") or api_key.startswith("AQ.")):
         return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "Missing Gemini API Key.", "estimated_tokens": estimated_tokens}
     if estimated_tokens is None:
         estimated_tokens = estimate_analysis_tokens(system_prompt, user_content)
