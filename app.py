@@ -2274,7 +2274,7 @@ def run_news_analysis_cycle(event, all_data, symbols):
 GEMINI_MIN_REQUEST_INTERVAL = 3
 GEMINI_TOKEN_LIMIT_PER_MINUTE = 500000
 GEMINI_ESTIMATED_RESPONSE_TOKENS = 600
-GEMINI_MODELS = ["gemini-1.5-flash", "gemini-1.5-pro"]
+GEMINI_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest']
 
 def estimate_tokens_for_text(text):
     return max(1, int(len(text) / 4))
