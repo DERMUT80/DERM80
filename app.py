@@ -1645,74 +1645,73 @@ def get_pair_config(symbol):
     base = {
         'digits': 2,
         'tick_size': 0.01,
-
         'min_dist_pct': 0.0015,
         'max_risk_pct': 0.008,
-
         'min_rr': 1.3,
-        'target_rr': 1.6,
-
+        'target_rr': 2.0,
+        'max_rr': 3.0,
         'score_floor': MINIMUM_CONFLUENCE_SCORE,
         'candidate_score': MINIMUM_CONFLUENCE_SCORE,
         'cooldown_minutes': 30,
-
         'max_entry_gap_pct': 0.0025,
         'max_entry_points': 10,
-
-        'min_stop_atr': 0.8,
+        'min_stop_atr': 1.0,
         'max_stop_atr': 3.0,
-
-        'stop_buffer_atr': 0.20,
+        'stop_buffer_atr': 0.25,
         'tp_buffer_atr': 0.12,
-
         'market_zone_atr': 0.20,
         'limit_zone_atr': 0.90,
         'stop_zone_atr': 0.90,
-
         'spread_multiplier': 1.5,
     }
-
     overrides = {
         'XAUUSD': {
             'digits': 2,
             'tick_size': 0.01,
-            'min_dist_pct': 0.0015,
-            'max_risk_pct': 0.008,
+            'min_dist_pct': 0.0028,
+            'max_risk_pct': 0.010,
             'max_entry_gap_pct': 0.003,
             'max_entry_points': 10,
-            'target_rr': 1.6,
+            'min_stop_atr': 1.2,
+            'target_rr': 2.0,
+            'max_rr': 3.0,
         },
         'EURUSD': {
             'digits': 5,
             'tick_size': 0.00001,
-            'min_dist_pct': 0.0005,
-            'max_risk_pct': 0.003,
+            'min_dist_pct': 0.0012,
+            'max_risk_pct': 0.004,
             'max_entry_gap_pct': 0.002,
             'max_entry_points': 0.0025,
-            'target_rr': 1.5,
+            'min_stop_atr': 1.0,
+            'target_rr': 2.0,
+            'max_rr': 3.0,
             'max_stop_atr': 2.5,
         },
         'BTCUSD': {
             'digits': 2,
             'tick_size': 0.01,
-            'min_dist_pct': 0.004,
-            'max_risk_pct': 0.012,
+            'min_dist_pct': 0.006,
+            'max_risk_pct': 0.015,
             'max_entry_gap_pct': 0.004,
             'max_entry_points': 150,
-            'target_rr': 1.8,
+            'min_stop_atr': 1.2,
+            'target_rr': 2.0,
+            'max_rr': 3.0,
             'max_stop_atr': 3.5,
         },
         'US30': {
             'digits': 1,
             'tick_size': 0.1,
-            'min_dist_pct': 0.003,
-            'max_risk_pct': 0.008,
+            'min_dist_pct': 0.004,
+            'max_risk_pct': 0.010,
             'max_entry_gap_pct': 0.003,
             'max_entry_points': 120,
-            'target_rr': 1.5,
+            'min_stop_atr': 1.0,
+            'target_rr': 2.0,
+            'max_rr': 3.0,
         },
     }
-
     return {**base, **overrides.get(symbol, {})}
 
 
@@ -2484,83 +2483,65 @@ def check_level_math(signal, order_type, entry, sl, tp, current_price, atr, pair
         current_price = float(current_price)
     except Exception:
         return False, "Missing or non-numeric entry/SL/TP."
-
     if entry <= 0 or sl <= 0 or tp <= 0 or current_price <= 0:
         return False, "Entry, SL, TP, and current price must be positive."
-
     max_entry_gap = min(
         float(pair_config.get('max_entry_points', 10) or 10),
         current_price * float(pair_config.get('max_entry_gap_pct', 0.003) or 0.003)
     )
-
     if atr:
         max_entry_gap = min(max_entry_gap, float(atr) * float(pair_config.get('limit_zone_atr', 1.0)))
-
     if abs(entry - current_price) > max_entry_gap:
         return False, f"Entry too far from live price. Gap={abs(entry - current_price):.6f}, max={max_entry_gap:.6f}."
-
     order_type = str(order_type or '').upper()
-
     if order_type == 'LIMIT':
         if signal == 'BUY' and entry >= current_price:
             return False, "BUY LIMIT must be below current price."
         if signal == 'SELL' and entry <= current_price:
             return False, "SELL LIMIT must be above current price."
-
     if order_type == 'STOP':
         if signal == 'BUY' and entry <= current_price:
             return False, "BUY STOP must be above current price."
         if signal == 'SELL' and entry >= current_price:
             return False, "SELL STOP must be below current price."
-
     min_stop_distance = max(
         abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
-        float(atr or 0.0) * float(pair_config.get('min_stop_atr', 0.8))
+        float(atr or 0.0) * float(pair_config.get('min_stop_atr', 1.0))
     )
-
     max_stop_price = abs(entry) * float(pair_config.get('max_risk_pct', 0.008))
-
     if atr:
         max_stop_distance = min(max_stop_price, float(atr) * float(pair_config.get('max_stop_atr', 3.0)))
     else:
         max_stop_distance = max_stop_price
-
     if signal == 'BUY':
         if sl >= entry:
             return False, f"BUY SL must be below entry. SL={sl}, entry={entry}."
         if tp <= entry:
             return False, f"BUY TP must be above entry. TP={tp}, entry={entry}."
-
         risk = entry - sl
         reward = tp - entry
-
     elif signal == 'SELL':
         if sl <= entry:
             return False, f"SELL SL must be above entry. SL={sl}, entry={entry}."
         if tp >= entry:
             return False, f"SELL TP must be below entry. TP={tp}, entry={entry}."
-
         risk = sl - entry
         reward = entry - tp
-
     else:
         return False, "Invalid signal."
-
     if risk <= 0:
         return False, "Risk distance must be positive."
-
     if risk < min_stop_distance * 0.95:
         return False, f"Stop too tight. Risk={risk:.6f}, min={min_stop_distance:.6f}."
-
     if risk > max_stop_distance * 1.05:
         return False, f"Stop too wide. Risk={risk:.6f}, max={max_stop_distance:.6f}."
-
     rr = reward / risk if risk > 0 else 0
     min_rr = float(pair_config.get('min_rr', pair_config.get('target_rr', 1.3)))
-
+    max_rr = float(pair_config.get('max_rr', 3.0))
     if rr + 0.01 < min_rr:
         return False, f"RR too low. RR={rr:.2f}, min={min_rr:.2f}."
-
+    if rr > max_rr * 1.05:
+        return False, f"RR too high / TP too far from entry. RR={rr:.2f}, max={max_rr:.2f}."
     return True, "Valid"
 
 
@@ -2750,84 +2731,56 @@ def build_structural_plan_v2(signal, entry, current_price, swings, order_blocks,
         current_price = float(current_price)
     except Exception:
         return None
-
     if signal not in ('BUY', 'SELL'):
         return None
-
     tick = float(pair_config.get('tick_size', 0.01) or 0.01)
-
     if atr is None or float(atr) <= 0:
         atr = abs(entry) * float(pair_config.get('min_dist_pct', 0.0015))
-
     atr = float(atr)
-
     stop_buffer = max(
-        atr * float(pair_config.get('stop_buffer_atr', 0.20)),
+        atr * float(pair_config.get('stop_buffer_atr', 0.25)),
         tick * 3.0
     )
-
     tp_buffer = max(
         atr * float(pair_config.get('tp_buffer_atr', 0.12)),
         tick * 2.0
     )
-
     min_stop_distance = max(
         abs(entry) * float(pair_config.get('min_dist_pct', 0.0015)),
-        atr * float(pair_config.get('min_stop_atr', 0.8))
+        atr * float(pair_config.get('min_stop_atr', 1.0))
     )
-
     max_stop_price = abs(entry) * float(pair_config.get('max_risk_pct', 0.008))
     max_stop_distance = min(max_stop_price, atr * float(pair_config.get('max_stop_atr', 3.0)))
-
     sl_anchor, tp_anchor = get_structural_anchors(signal, entry, swings, order_blocks, fvgs)
-
-    target_rr = float(pair_config.get('target_rr', 1.6))
+    target_rr = float(pair_config.get('target_rr', 2.0))
     min_rr = float(pair_config.get('min_rr', 1.3))
-
+    max_rr = float(pair_config.get('max_rr', 3.0))
     if signal == 'BUY':
         if sl_anchor is not None:
             sl = sl_anchor - stop_buffer
         else:
             sl = entry - min_stop_distance
-
         risk = entry - sl
-
         if risk < min_stop_distance:
             sl = entry - min_stop_distance
             risk = min_stop_distance
-
         if risk > max_stop_distance:
             sl = entry - max_stop_distance
             risk = max_stop_distance
-
         if risk <= 0:
             return None
-
-        rr_target = entry + risk * target_rr
-        structure_target = (tp_anchor - tp_buffer) if tp_anchor is not None else rr_target
-
+        structure_target = (tp_anchor - tp_buffer) if tp_anchor is not None else None
         tp = None
-
-        if structure_target > entry:
-            structure_rr = (structure_target - entry) / risk
-            if structure_rr >= min_rr:
-                tp = structure_target
-
-        if tp is None and rr_target > entry:
-            if tp_anchor is None or rr_target <= tp_anchor:
-                rr = (rr_target - entry) / risk
-                if rr >= min_rr:
-                    tp = rr_target
-
+        if structure_target is not None and structure_target > entry:
+            srr = (structure_target - entry) / risk
+            if srr >= min_rr:
+                tp = min(structure_target, entry + risk * max_rr)
         if tp is None:
-            tp = entry + risk * max(target_rr, min_rr)
-
+            tp = min(entry + risk * target_rr, entry + risk * max_rr)
         if (tp - entry) / risk < min_rr:
             tp = entry + risk * min_rr
-
         order_type = infer_order_type(signal, entry, current_price, pair_config, atr)
         rr = round((tp - entry) / risk, 2) if risk > 0 else 0
-
         return {
             'entry': round_price(entry, pair_config),
             'stop_loss': round_price(sl, pair_config),
@@ -2837,51 +2790,32 @@ def build_structural_plan_v2(signal, entry, current_price, swings, order_blocks,
             'order_type': order_type,
             'levels_source': 'PYTHON',
         }
-
     if signal == 'SELL':
         if sl_anchor is not None:
             sl = sl_anchor + stop_buffer
         else:
             sl = entry + min_stop_distance
-
         risk = sl - entry
-
         if risk < min_stop_distance:
             sl = entry + min_stop_distance
             risk = min_stop_distance
-
         if risk > max_stop_distance:
             sl = entry + max_stop_distance
             risk = max_stop_distance
-
         if risk <= 0:
             return None
-
-        rr_target = entry - risk * target_rr
-        structure_target = (tp_anchor + tp_buffer) if tp_anchor is not None else rr_target
-
+        structure_target = (tp_anchor + tp_buffer) if tp_anchor is not None else None
         tp = None
-
-        if structure_target < entry:
-            structure_rr = (entry - structure_target) / risk
-            if structure_rr >= min_rr:
-                tp = structure_target
-
-        if tp is None and rr_target < entry:
-            if tp_anchor is None or rr_target >= tp_anchor:
-                rr = (entry - rr_target) / risk
-                if rr >= min_rr:
-                    tp = rr_target
-
+        if structure_target is not None and structure_target < entry:
+            srr = (entry - structure_target) / risk
+            if srr >= min_rr:
+                tp = max(structure_target, entry - risk * max_rr)
         if tp is None:
-            tp = entry - risk * max(target_rr, min_rr)
-
+            tp = max(entry - risk * target_rr, entry - risk * max_rr)
         if (entry - tp) / risk < min_rr:
             tp = entry - risk * min_rr
-
         order_type = infer_order_type(signal, entry, current_price, pair_config, atr)
         rr = round((entry - tp) / risk, 2) if risk > 0 else 0
-
         return {
             'entry': round_price(entry, pair_config),
             'stop_loss': round_price(sl, pair_config),
@@ -2891,7 +2825,6 @@ def build_structural_plan_v2(signal, entry, current_price, swings, order_blocks,
             'order_type': order_type,
             'levels_source': 'PYTHON',
         }
-
     return None
 
 
@@ -3936,7 +3869,7 @@ if st.button("🔍 Run Macro Analysis Now", type="secondary", disabled=st.sessio
             for i, symbol in enumerate(selected_symbols):
                 next_pair = selected_symbols[i + 1] if i + 1 < len(selected_symbols) else None
                 if st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited():
-                    st.warning("⏳ Rate limit reached for GPT. Attempting local fallback or cached result for this symbol.")
+                    add_notification('warning', '⏳ Rate limit reached. Using cached/fallback analysis for this symbol.', symbol=symbol)
                     cached_result = get_cached_analysis(symbol)
                     result = cached_result if cached_result is not None else _local_fallback(symbol, all_data)
                     set_cached_analysis(symbol, result)
@@ -3973,7 +3906,7 @@ if st.session_state.get('analysis_in_progress'):
 
 if st.session_state.bot_running:
     if st.session_state.analysis_in_progress:
-        st.info("🔄 Analysis is already in progress. Refreshing status and countdown...")
+        render_analysis_status(status_placeholder)
     elif st.session_state.next_check_time:
         time_left = (st.session_state.next_check_time - datetime.now()).total_seconds()
         if time_left > 0:
@@ -3981,18 +3914,19 @@ if st.session_state.bot_running:
         elif is_scheduled_run_due():
             scheduled_start = st.session_state.next_check_time or datetime.now()
             if is_gpt_rate_limited():
-                st.warning("⏳ Gemini rate limit in effect - using cached/fallback analysis this cycle to keep the strict 5-minute cadence.")
+                add_notification('warning', '⏳ Gemini rate limit in effect - using cached/fallback analysis this cycle.')
             st.session_state.analysis_in_progress = True
             st.session_state.analysis_started_at = datetime.now()
             try:
-                st.info("🔄 Running scheduled analysis...")
+                update_analysis_status(symbol='SYSTEM', message='Running scheduled analysis...')
+                render_analysis_status(status_placeholder)
                 progress_bar = st.progress(0)
                 st.session_state.rate_limit_hit = False
                 all_data = load_market_data(force_refresh=False)
                 for i, symbol in enumerate(selected_symbols):
                     next_pair = selected_symbols[i + 1] if i + 1 < len(selected_symbols) else None
                     if st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited():
-                        st.warning("⏳ Rate limit reached. Using cached/fallback analysis for this symbol.")
+                        add_notification('warning', '⏳ Rate limit reached. Using cached/fallback analysis for this symbol.', symbol=symbol)
                         cached_result = get_cached_analysis(symbol)
                         result = cached_result if cached_result is not None else _local_fallback(symbol, all_data)
                         update_analysis_status(symbol=symbol, message=f"Rate-limited: cached/fallback analysis for {symbol}", next_pair=next_pair)
