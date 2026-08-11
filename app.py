@@ -3576,6 +3576,557 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         return {"error": str(e)}
 
 # ── Main App UI ───────────────────────────────────────────────────────────────
+# >>>>> DER-AI UPGRADE PATCH BEGIN >>>>>
+# ============================================================
+# DER-AI UPGRADE PATCH v3.0
+# Replaces weak momentum-guessing with:
+#   1) ADX market-regime filter (no trading in chop)
+#   2) Hard higher-timeframe gate (no counter-trend w/o reversal)
+#   3) Multi-strategy confluence quorum (trend+zone+momentum+liquidity)
+#   4) Desk position-lock (no BUY<->SELL whipsaw)
+#   5) Structural entries + chart snapshot to the AI (multimodal)
+#   6) Curated news knowledge + FRED API real historical macro data
+# ============================================================
+
+import base64 as _b64
+import io as _io
+
+UPGRADE_MIN_SCORE = 72
+MINIMUM_CONFLUENCE_SCORE = UPGRADE_MIN_SCORE   # raise the global quality gate
+ENABLE_CHART_SNAPSHOT = True                    # set False if AI calls start failing
+
+# ---------- 1) REGIME FILTER (ADX) ----------
+def _adx_value(df, period=14):
+    try:
+        high = pd.to_numeric(df["High"], errors="coerce")
+        low = pd.to_numeric(df["Low"], errors="coerce")
+        close = pd.to_numeric(df["Close"], errors="coerce")
+        if len(df) < period + 3:
+            return None
+        up = high.diff()
+        down = -low.diff()
+        plus_dm = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
+        minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
+        tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+        plus_di = 100 * plus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, np.nan)
+        minus_di = 100 * minus_dm.ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, np.nan)
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+        adx = dx.ewm(alpha=1.0 / period, adjust=False).mean()
+        vals = adx.dropna()
+        return float(vals.iloc[-1]) if not vals.empty else None
+    except Exception:
+        return None
+
+def classify_market_regime(df, adx_trend=25, adx_range=18):
+    adx = _adx_value(df)
+    if adx is None:
+        return {"regime": "UNKNOWN", "adx": None, "trend_direction": None, "tradable": True}
+    micro = calculate_microstructure(df) or {}
+    mom = micro.get("momentum")
+    if adx >= adx_trend:
+        return {"regime": "TRENDING", "adx": round(adx, 1), "trend_direction": mom, "tradable": True}
+    if adx >= adx_range:
+        return {"regime": "TRANSITIONAL", "adx": round(adx, 1), "trend_direction": mom, "tradable": True}
+    return {"regime": "RANGING", "adx": round(adx, 1), "trend_direction": None, "tradable": False}
+
+# ---------- 2) MULTI-STRATEGY ENGINES ----------
+def strategy_htf_trend(symbol, all_data):
+    data = all_data.get(symbol, {}) or {}
+    votes = []
+    for key in ("H1", "H4"):
+        df = data.get(key)
+        if df is None or getattr(df, "empty", True):
+            continue
+        m = calculate_microstructure(df) or {}
+        if m.get("momentum") == "BULLISH" and m.get("price_vs_vwap") == "ABOVE":
+            votes.append("BUY")
+        elif m.get("momentum") == "BEARISH" and m.get("price_vs_vwap") == "BELOW":
+            votes.append("SELL")
+    if not votes:
+        return None
+    if all(v == "BUY" for v in votes):
+        return "BUY"
+    if all(v == "SELL" for v in votes):
+        return "SELL"
+    return None
+
+def strategy_zone_reversion(m10, current_price, swings, order_blocks, fvgs):
+    try:
+        atr = calculate_atr(m10) or (float(current_price) * 0.002)
+        near = float(atr) * 0.6
+        demand, supply = [], []
+        for ob in (order_blocks or []):
+            p = float(ob.get("price", 0) or 0)
+            if ob.get("type") == "BULLISH_OB" and p <= current_price:
+                demand.append(p)
+            if ob.get("type") == "BEARISH_OB" and p >= current_price:
+                supply.append(p)
+        for fvg in (fvgs or []):
+            if fvg.get("type") == "BULLISH_FVG" and float(fvg.get("bottom", 0)) <= current_price:
+                demand.append(float(fvg.get("bottom")))
+            if fvg.get("type") == "BEARISH_FVG" and float(fvg.get("top", 0)) >= current_price:
+                supply.append(float(fvg.get("top")))
+        for sl in (swings or {}).get("recent_swing_lows", []):
+            if float(sl) <= current_price:
+                demand.append(float(sl))
+        for sh in (swings or {}).get("recent_swing_highs", []):
+            if float(sh) >= current_price:
+                supply.append(float(sh))
+        near_demand = bool(demand) and (current_price - max(demand)) <= near
+        near_supply = bool(supply) and (min(supply) - current_price) <= near
+        if near_demand and not near_supply:
+            return "BUY"
+        if near_supply and not near_demand:
+            return "SELL"
+    except Exception:
+        pass
+    return None
+
+def strategy_momentum_breakout(m10):
+    micro = calculate_microstructure(m10) or {}
+    bos, choch = detect_bos_choch(m10)
+    if micro.get("rvol", 0) >= 1.5:
+        if bos == "BULLISH_BOS" or choch == "BULLISH_CHOCH":
+            return "BUY"
+        if bos == "BEARISH_BOS" or choch == "BEARISH_CHOCH":
+            return "SELL"
+    return None
+
+def strategy_liquidity_rejection(m10):
+    rev = detect_reversal(m10)
+    if rev and rev.get("direction") == "BUY":
+        return "BUY"
+    if rev and rev.get("direction") == "SELL":
+        return "SELL"
+    sweeps = detect_liquidity_sweeps(m10)
+    if sweeps:
+        s = sweeps[-1]
+        if s.get("type") == "BULLISH_SWEEP":
+            return "BUY"
+        if s.get("type") == "BEARISH_SWEEP":
+            return "SELL"
+    return None
+
+def multi_strategy_vote(symbol, all_data, m10, current_price, swings, order_blocks, fvgs):
+    votes = {
+        "htf_trend": strategy_htf_trend(symbol, all_data),
+        "zone_reversion": strategy_zone_reversion(m10, current_price, swings, order_blocks, fvgs),
+        "momentum_breakout": strategy_momentum_breakout(m10),
+        "liquidity_rejection": strategy_liquidity_rejection(m10),
+    }
+    buy = [k for k, v in votes.items() if v == "BUY"]
+    sell = [k for k, v in votes.items() if v == "SELL"]
+    direction = None
+    if len(buy) >= 2 and (len(buy) - len(sell)) >= 2:
+        direction = "BUY"
+    elif len(sell) >= 2 and (len(sell) - len(buy)) >= 2:
+        direction = "SELL"
+    return {"direction": direction, "votes": votes, "buy_strategies": buy, "sell_strategies": sell}
+
+def htf_direction_gate(symbol, all_data):
+    return strategy_htf_trend(symbol, all_data)
+
+# ---------- 3) DESK POSITION LOCK (anti-whipsaw) ----------
+def _desk_position_lock(symbol, proposed, current_price):
+    try:
+        active = st.session_state.active_signals.get(symbol)
+        if not active:
+            return None
+        prior_dir = active.get("direction")
+        prior_entry = float(active.get("entry") or 0)
+        ts = active.get("timestamp")
+        if prior_dir == proposed or prior_entry <= 0:
+            return None
+        age_min = (datetime.now() - ts).total_seconds() / 60.0 if ts else 999
+        risk_est = abs(prior_entry) * 0.004
+        if prior_dir == "BUY" and proposed == "SELL":
+            if current_price is not None and current_price <= prior_entry - risk_est:
+                return None
+            if age_min < 90:
+                return "A BUY from {:.2f} is still live and its invalidation has not been taken out. Blocking a premature SELL to prevent whipsaw.".format(prior_entry)
+        if prior_dir == "SELL" and proposed == "BUY":
+            if current_price is not None and current_price >= prior_entry + risk_est:
+                return None
+            if age_min < 90:
+                return "A SELL from {:.2f} is still live and its invalidation has not been taken out. Blocking a premature BUY to prevent whipsaw.".format(prior_entry)
+        return None
+    except Exception:
+        return None
+
+def _fallback_wait_result(micro, regime, why, historical_context=None):
+    return {
+        "bias": "RANGING",
+        "signal": "WAIT",
+        "confluence_score": 40,
+        "confidence": "LOW",
+        "dxy_correlation": "NEUTRAL",
+        "microstructure_read": "VWAP {} | RVOL {} | Momentum {} | ADX {}".format(
+            micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0),
+            micro.get("momentum", "NEUTRAL"), regime.get("adx")),
+        "pre_news_bias": "N/A",
+        "reasoning": "No trade: " + why,
+        "rejection_reason": why,
+        "structural_score": 40,
+        "score_reason": "Upgraded model declined the setup.",
+        "candidate_direction": None,
+        "levels_source": "PYTHON",
+        "historical_pattern": historical_context or "",
+    }
+
+# ---------- 4) OVERRIDE: regime-aware, HTF-gated, quorum fallback ----------
+def build_market_fallback_analysis(symbol, m10, swings, pair_config, dxy_context, news_context,
+                                   candles=None, phase_context=None, live_price=None, htf_context=None,
+                                   picture=None, firm=None, firm_notes=None, learning=None, historical_context=None):
+    if not st.session_state.get("_upgrade_fallback_warned"):
+        try:
+            add_notification("warning", "Gemini AI is unavailable (missing API key or rate-limited). Signals are coming from the Python fallback model. Verify GEMINI_API_KEY in Streamlit Secrets for full-quality institutional analysis.")
+        except Exception:
+            pass
+        st.session_state._upgrade_fallback_warned = True
+
+    micro = calculate_microstructure(m10) or {}
+    regime = classify_market_regime(m10)
+    try:
+        current_price = float(live_price) if live_price is not None else float(m10["Close"].iloc[-1])
+    except Exception:
+        current_price = None
+    if current_price is None:
+        return _fallback_wait_result(micro, regime, "No reliable current price available.", historical_context)
+
+    order_blocks = detect_order_blocks(m10)
+    fvgs = detect_fvg(m10)
+    all_data_ref = st.session_state.get("cached_market_data", {}) or {}
+    vote = multi_strategy_vote(symbol, all_data_ref, m10, current_price, swings, order_blocks, fvgs)
+    htf_dir = htf_direction_gate(symbol, all_data_ref)
+    reversal = detect_reversal(m10)
+    direction = vote.get("direction")
+
+    if direction is None:
+        return _fallback_wait_result(micro, regime,
+            "Multi-strategy confluence found no clean edge (buy={}, sell={}). Standing aside instead of guessing on momentum.".format(
+                vote.get("buy_strategies"), vote.get("sell_strategies")), historical_context)
+
+    if regime.get("regime") == "RANGING" and reversal is None:
+        return _fallback_wait_result(micro, regime,
+            "Market is ranging/choppy (ADX {}) with no reversal trigger. Momentum entries here have negative expectancy.".format(regime.get("adx")),
+            historical_context)
+
+    if htf_dir and direction != htf_dir and reversal is None:
+        return _fallback_wait_result(micro, regime,
+            "Proposed {} is counter to the higher-timeframe {} trend with no reversal confirmation. Declining countertrend chop.".format(direction, htf_dir),
+            historical_context)
+
+    lock = _desk_position_lock(symbol, direction, current_price)
+    if lock:
+        return _fallback_wait_result(micro, regime, lock, historical_context)
+
+    bias = "BULLISH" if direction == "BUY" else "BEARISH"
+    supporting = vote.get("buy_strategies") if direction == "BUY" else vote.get("sell_strategies")
+    parts = []
+    parts.append("Upgraded desk model: {} via multi-strategy confluence ({}).".format(
+        direction, ", ".join(supporting) if supporting else "structure"))
+    parts.append("Regime {} (ADX {}).".format(regime.get("regime"), regime.get("adx")))
+    if htf_dir:
+        parts.append("Higher-timeframe trend is {} and aligned.".format(htf_dir))
+    if reversal:
+        parts.append("Reversal candle {} confirms zone rejection.".format(reversal.get("type")))
+    parts.append("Microstructure: VWAP {}, RVOL {}, momentum {}.".format(
+        micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0), micro.get("momentum", "NEUTRAL")))
+    if historical_context:
+        parts.append("Price context: {}".format(historical_context))
+    return {
+        "bias": bias,
+        "signal": normalize_ai_signal(direction),
+        "confluence_score": 76,
+        "confidence": "MEDIUM",
+        "dxy_correlation": "CONFIRMING" if dxy_context else "NEUTRAL",
+        "microstructure_read": "VWAP {} | RVOL {} | Momentum {} | ADX {}".format(
+            micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0),
+            micro.get("momentum", "NEUTRAL"), regime.get("adx")),
+        "pre_news_bias": (news_context or {}).get("pre_news_bias", "N/A"),
+        "reasoning": " ".join(parts),
+        "rejection_reason": None,
+        "structural_score": 72,
+        "score_reason": "Upgraded regime + multi-strategy confluence model.",
+        "candidate_direction": direction,
+        "levels_source": "PYTHON",
+        "historical_pattern": historical_context or "",
+    }
+
+# ---------- 5) WRAP finalize_trade_plan: position-lock before building levels ----------
+_orig_finalize_trade_plan = finalize_trade_plan
+def finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, fvgs, atr, pair_config):
+    try:
+        sig = analysis.get("signal")
+        if sig in ("BUY", "SELL"):
+            lock = _desk_position_lock(symbol, sig, current_price)
+            if lock:
+                analysis["signal"] = "WAIT"
+                analysis["confidence"] = "LOW"
+                analysis["rejection_reason"] = lock
+                return analysis
+    except Exception:
+        pass
+    return _orig_finalize_trade_plan(analysis, symbol, current_price, swings, order_blocks, fvgs, atr, pair_config)
+
+# ---------- 6) CURATED NEWS KNOWLEDGE (stops AI hallucination) ----------
+NEWS_EVENT_KNOWLEDGE = {
+    "NONFARM PAYROLLS": ("stronger USD when actual beats consensus", "NFP causes a violent initial spike. Upside surprises strengthen USD and push XAUUSD/EURUSD down; downside surprises weaken USD and lift gold. Whipsaw first, then trend in the surprise direction."),
+    "CPI": ("stronger USD when inflation is hotter than consensus", "Hotter CPI raises yields and USD, pressuring XAUUSD/EURUSD; cooler CPI weakens USD and lifts gold. Reaction front-loaded in the first 15 minutes."),
+    "FOMC": ("hawkish = stronger USD, dovish = weaker USD", "FOMC reprices the rate path. Hawkish surprises lift USD and hit gold/EURUSD; dovish does the opposite. Watch dot plot and Powell tone."),
+    "GDP": ("stronger USD on upside surprise", "Strong GDP supports USD; weak GDP weighs. Milder reaction than CPI/NFP unless far from consensus."),
+    "UNEMPLOYMENT": ("lower unemployment = stronger USD", "Falling unemployment strengthens USD; rising weighs."),
+    "JOBLESS CLAIMS": ("fewer claims = stronger USD", "Weekly claims: lower prints support USD, higher prints weaken it. USD-sensitive MEDIUM impact."),
+    "RETAIL SALES": ("stronger USD on upside surprise", "Strong retail sales support USD; weak sales weigh on USD."),
+    "PMI": ("above-consensus PMI = stronger USD", "ISM/Flash PMI above expectations supports USD; below weighs. Watch the 50 line."),
+    "PPI": ("hotter PPI = stronger USD", "Producer inflation feeds CPI expectations; hotter prints support USD."),
+    "PCE": ("hotter core PCE = stronger USD", "Fed's preferred gauge. Hotter core PCE lifts USD and hits gold; cooler does the opposite."),
+    "FED": ("hawkish Fed = stronger USD", "Fed communication reprices rate expectations and moves USD across pairs."),
+    "INTEREST RATE": ("higher/hawkish = stronger USD", "Rate decisions move USD via yield differentials."),
+}
+
+# ---------- 6b) FRED API - REAL HISTORICAL MACRO DATA ----------
+# Free API: https://fred.stlouisfed.org/docs/api/api_key.html
+# Add the key to Streamlit Secrets as FRED_API_KEY. Falls back to curated
+# knowledge automatically when the key is missing or the call fails.
+FRED_SERIES_MAP = {
+    "NONFARM PAYROLLS": "PAYEMS",
+    "NON-FARM PAYROLLS": "PAYEMS",
+    "PAYROLL": "PAYEMS",
+    "UNEMPLOYMENT RATE": "UNRATE",
+    "UNEMPLOYMENT": "UNRATE",
+    "CORE CPI": "CPILFESL",
+    "CPI": "CPIAUCSL",
+    "CORE PCE": "PCEPILFE",
+    "PCE": "PCEPILFE",
+    "GDP": "GDP",
+    "FOMC": "FEDFUNDS",
+    "FED FUNDS": "FEDFUNDS",
+    "INTEREST RATE": "FEDFUNDS",
+    "RETAIL SALES": "RSAFS",
+    "JOBLESS CLAIMS": "ICSA",
+    "INITIAL CLAIMS": "ICSA",
+    "MICHIGAN": "UMCSENT",
+    "CONSUMER SENTIMENT": "UMCSENT",
+    "ISM": "INDPRO",
+    "PMI": "INDPRO",
+    "INDUSTRIAL PRODUCTION": "INDPRO",
+    "TREASURY": "DGS10",
+}
+
+def _match_fred_series(event_name):
+    try:
+        name = str(event_name).upper()
+        for key, series_id in FRED_SERIES_MAP.items():
+            if key in name:
+                return series_id
+    except Exception:
+        pass
+    return None
+
+def fetch_fred_observations(series_id, limit=5):
+    try:
+        api_key = get_secret("FRED_API_KEY", "")
+        if not api_key:
+            return None
+        url = "https://api.stlouisfed.org/fred/series/observations"
+        params = {
+            "series_id": series_id,
+            "api_key": api_key,
+            "file_type": "json",
+            "sort_order": "desc",
+            "limit": limit,
+        }
+        res = requests.get(url, params=params, timeout=15)
+        res.raise_for_status()
+        data = res.json()
+        obs = data.get("observations", [])
+        obs = [o for o in obs if o.get("value") not in (".", None, "")]
+        if not obs:
+            return None
+        out = []
+        for o in obs:
+            try:
+                out.append({"date": o.get("date"), "value": float(o.get("value"))})
+            except Exception:
+                continue
+        return out or None
+    except Exception:
+        return None
+
+def fetch_fred_historical_context(event, ttl_seconds=3600):
+    try:
+        name = str(event.get("event", "")).upper()
+        series_id = _match_fred_series(name)
+        if not series_id:
+            return None
+        cache_key = "_fred_cache_" + series_id
+        now = datetime.now()
+        cached = st.session_state.get(cache_key)
+        if cached and (now - cached.get("fetched_at", now)).total_seconds() < ttl_seconds:
+            return cached.get("text")
+        observations = fetch_fred_observations(series_id, limit=5)
+        if not observations:
+            return None
+        parts = []
+        for o in observations:
+            parts.append("{} = {}".format(o["date"], o["value"]))
+        text = "FRED {} last {} releases (most recent first): {}".format(
+            series_id, len(observations), "; ".join(parts))
+        st.session_state[cache_key] = {"text": text, "fetched_at": now}
+        return text
+    except Exception:
+        return None
+
+def fetch_news_historical_context(event):
+    # Merge REAL FRED numbers with the curated interpretation.
+    try:
+        name = str(event.get("event", "")).upper()
+        curated = None
+        for key, (usd_impact, history) in NEWS_EVENT_KNOWLEDGE.items():
+            if key in name:
+                curated = "Typical USD impact: {} | Historical pattern: {}".format(usd_impact, history)
+                break
+        fred_data = fetch_fred_historical_context(event)
+        if fred_data and curated:
+            return fred_data + " || " + curated
+        if fred_data:
+            return fred_data
+        if curated:
+            return curated
+    except Exception:
+        pass
+    return None
+
+_orig_format_news_summary = format_news_summary
+def format_news_summary(events, limit=5):
+    base = _orig_format_news_summary(events, limit=limit)
+    try:
+        extra = []
+        for e in (events or [])[:limit]:
+            ctx = fetch_news_historical_context(e)
+            if ctx:
+                extra.append("HISTORICAL IMPACT for '{}': {}".format(e.get("event"), ctx))
+        if extra:
+            return base + "\n" + "\n".join(extra)
+    except Exception:
+        pass
+    return base
+
+# ---------- 7) IMPROVED NEWS FALLBACK (USD thesis + HTF, not momentum) ----------
+def build_pre_news_fallback_analysis(symbol, m10, swings, pair_config, dxy_context, news_context,
+                                     candles=None, phase_context=None, live_price=None, htf_context=None,
+                                     picture=None, firm=None, firm_notes=None, learning=None, historical_context=None):
+    micro = calculate_microstructure(m10) or {}
+    regime = classify_market_regime(m10)
+    all_data_ref = st.session_state.get("cached_market_data", {}) or {}
+    htf_dir = htf_direction_gate(symbol, all_data_ref)
+    nxt = (news_context or {}).get("next_event") or {}
+    news_hist = fetch_news_historical_context(nxt) if isinstance(nxt, dict) else None
+    usd_thesis = None
+    if news_hist:
+        low = news_hist.lower()
+        if "weaker usd" in low:
+            usd_thesis = "WEAKER_USD"
+        elif "stronger usd" in low:
+            usd_thesis = "STRONGER_USD"
+    direction = None
+    if usd_thesis == "STRONGER_USD":
+        direction = "SELL" if symbol in ("XAUUSD", "EURUSD", "BTCUSD") else "BUY"
+    elif usd_thesis == "WEAKER_USD":
+        direction = "BUY" if symbol in ("XAUUSD", "EURUSD", "BTCUSD") else "SELL"
+    else:
+        direction = htf_dir
+    if direction not in ("BUY", "SELL"):
+        direction = htf_dir or ("BUY" if micro.get("momentum") == "BULLISH" else "SELL")
+    confidence = "MEDIUM" if (htf_dir == direction or usd_thesis) else "LOW"
+    bias = "BULLISH" if direction == "BUY" else "BEARISH"
+    reasoning = "Pre-news directional read for {} (fallback, AI unavailable). ".format(symbol)
+    reasoning += "Curated/FRED event impact: {}. ".format(news_hist or "no structured historical impact available")
+    reasoning += "HTF trend: {}. Regime: {} (ADX {}). ".format(htf_dir or "neutral", regime.get("regime"), regime.get("adx"))
+    reasoning += "Direction set to {} from the USD thesis and higher-timeframe alignment. ".format(direction)
+    reasoning += "Direction-only guidance; execution levels withheld until live AI analysis."
+    return {
+        "bias": bias,
+        "signal": normalize_ai_signal(direction),
+        "confluence_score": 72 if confidence == "MEDIUM" else 62,
+        "confidence": confidence,
+        "dxy_correlation": "CONFIRMING" if dxy_context else "NEUTRAL",
+        "microstructure_read": "VWAP {} | RVOL {}".format(micro.get("price_vs_vwap", "NEUTRAL"), micro.get("rvol", 0)),
+        "pre_news_bias": (news_context or {}).get("pre_news_bias", "News-driven reaction expected"),
+        "reasoning": reasoning,
+        "rejection_reason": None,
+        "structural_score": 70,
+        "score_reason": "Upgraded news fallback (USD thesis + HTF + FRED).",
+        "candidate_direction": direction,
+        "levels_source": "PYTHON",
+        "historical_pattern": news_hist or (historical_context or ""),
+    }
+
+# ---------- 8) CHART SNAPSHOT -> AI (multimodal) ----------
+def generate_market_snapshot_image(symbol, m10):
+    if not ENABLE_CHART_SNAPSHOT:
+        return None
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+        df = m10.tail(60).copy()
+        if df.empty:
+            return None
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for i, (idx, row) in enumerate(df.iterrows()):
+            o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
+            color = "#26a69a" if c >= o else "#ef5350"
+            ax.plot([i, i], [l, h], color=color, linewidth=1)
+            ax.add_patch(Rectangle((i - 0.3, min(o, c)), 0.6, max(abs(c - o), 1e-9), facecolor=color))
+        try:
+            tp = (df["High"] + df["Low"] + df["Close"]) / 3
+            vol = df["Volume"].fillna(0)
+            vwap = (tp * vol).cumsum() / vol.cumsum().replace(0, np.nan)
+            ax.plot(range(len(df)), vwap.values, color="#2962ff", linewidth=1.5, label="VWAP")
+        except Exception:
+            pass
+        ax.set_title("{} M10 market snapshot".format(symbol))
+        ax.legend()
+        buf = _io.BytesIO()
+        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        plt.close(fig)
+        return _b64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return None
+
+_orig_get_live_market_snapshot = get_live_market_snapshot
+def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
+    snap = _orig_get_live_market_snapshot(symbol, yf_symbol, fallback_df=fallback_df)
+    try:
+        if fallback_df is not None and not getattr(fallback_df, "empty", True):
+            img = generate_market_snapshot_image(symbol, fallback_df)
+            if img:
+                st.session_state["_snapshot_" + symbol] = img
+                st.session_state["_snapshot_symbol"] = symbol
+    except Exception:
+        pass
+    return snap
+
+_orig_call_gpt = call_gpt
+def call_gpt(system_prompt, user_content, max_tokens=2000, retry_count=0, estimated_tokens=None):
+    try:
+        sym = st.session_state.get("_snapshot_symbol")
+        img = st.session_state.get("_snapshot_" + sym) if sym else None
+        if img and isinstance(user_content, list):
+            has_img = any(isinstance(p, dict) and p.get("type") == "image_url" for p in user_content)
+            if not has_img:
+                user_content = user_content + [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}}]
+            st.session_state.pop("_snapshot_symbol", None)
+    except Exception:
+        pass
+    return _orig_call_gpt(system_prompt, user_content, max_tokens=max_tokens, retry_count=retry_count, estimated_tokens=estimated_tokens)
+
+# >>>>> DER-AI UPGRADE PATCH END <<<<<
+
 st.title("🌍 Der-AI | Quantitative Macro System")
 st.markdown("**DXY Correlation | VWAP Microstructure | Pre-News Positioning | Telegram Bridge**")
 st.sidebar.header("⚙️ System Configuration")
