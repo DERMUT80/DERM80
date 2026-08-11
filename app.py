@@ -3823,51 +3823,51 @@ def _local_fallback(symbol, all_data):
         'rejection_reason': 'Data unavailable for fallback'
     }
 
-    if st.button("🔍 Run Macro Analysis Now", type="secondary", disabled=st.session_state.bot_running):
-        try:
-            if is_gpt_rate_limited():
-                st.warning("⏳ Gemini rate limit in effect. Please wait before running another analysis.")
-            else:
-                progress_bar = st.progress(0)
-                st.session_state.rate_limit_hit = False
-                all_data = load_market_data(force_refresh=False)
-                for i, symbol in enumerate(selected_symbols):
-                    next_pair = selected_symbols[i + 1] if i + 1 < len(selected_symbols) else None
-                    if st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited():
-                        st.warning("⏳ Rate limit reached for GPT. Attempting local fallback or cached result for this symbol.")
-                        cached_result = get_cached_analysis(symbol)
-                        result = cached_result if cached_result is not None else _local_fallback(symbol, all_data)
-                        set_cached_analysis(symbol, result)
-                        try:
-                            process_symbol_result(result, symbol, is_auto=False, all_data=all_data)
-                        except Exception as proc_exc:
-                            add_notification('warning', f"❌ {symbol}: result processing failed: {proc_exc}", symbol=symbol)
-                    else:
-                        update_analysis_status(symbol=symbol, message=f"Starting analysis for {symbol}", next_pair=next_pair)
-                        render_analysis_status(status_placeholder)
-                        with st.spinner(f"Analyzing {symbol} with DXY Correlation..."):
-                            result = analyze_symbol_premium(symbol, all_data, news_override=None)
-                        set_cached_analysis(symbol, result)
-                        try:
-                            process_symbol_result(result, symbol, is_auto=False, all_data=all_data)
-                        except Exception as proc_exc:
-                            add_notification('warning', f"❌ {symbol}: result processing failed: {proc_exc}", symbol=symbol)
-                    if i < len(selected_symbols) - 1:
-                        time.sleep(GEMINI_MIN_REQUEST_INTERVAL)
-                    progress_bar.progress((i + 1) / len(selected_symbols))
-                progress_bar.empty()
-                st.session_state.last_analysis_time = datetime.now()
-                st.session_state.next_check_time = datetime.now() + timedelta(minutes=ANALYSIS_INTERVAL_MINUTES)
-                add_notification('info', f"✅ Analysis run complete. Next run at {st.session_state.next_check_time.strftime('%H:%M:%S')}.")
-        except Exception as e:
-            add_notification('warning', f"Analysis run failed: {str(e)}")
-            st.error(f"Analysis run failed: {str(e)}")
-    # WATCHDOG: clear a stale in-progress flag so scheduled analysis can never be blocked forever.
-    if st.session_state.get('analysis_in_progress'):
-        _run_started = st.session_state.get('analysis_started_at')
-        if _run_started is None or (datetime.now() - _run_started).total_seconds() > 900:
-            st.session_state.analysis_in_progress = False
-            add_notification('warning', '🔄 Watchdog cleared a stale analysis-in-progress flag.')
+if st.button("🔍 Run Macro Analysis Now", type="secondary", disabled=st.session_state.bot_running):
+    try:
+        if is_gpt_rate_limited():
+            st.warning("⏳ Gemini rate limit in effect. Please wait before running another analysis.")
+        else:
+            progress_bar = st.progress(0)
+            st.session_state.rate_limit_hit = False
+            all_data = load_market_data(force_refresh=False)
+            for i, symbol in enumerate(selected_symbols):
+                next_pair = selected_symbols[i + 1] if i + 1 < len(selected_symbols) else None
+                if st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited():
+                    st.warning("⏳ Rate limit reached for GPT. Attempting local fallback or cached result for this symbol.")
+                    cached_result = get_cached_analysis(symbol)
+                    result = cached_result if cached_result is not None else _local_fallback(symbol, all_data)
+                    set_cached_analysis(symbol, result)
+                    try:
+                        process_symbol_result(result, symbol, is_auto=False, all_data=all_data)
+                    except Exception as proc_exc:
+                        add_notification('warning', f"❌ {symbol}: result processing failed: {proc_exc}", symbol=symbol)
+                else:
+                    update_analysis_status(symbol=symbol, message=f"Starting analysis for {symbol}", next_pair=next_pair)
+                    render_analysis_status(status_placeholder)
+                    with st.spinner(f"Analyzing {symbol} with DXY Correlation..."):
+                        result = analyze_symbol_premium(symbol, all_data, news_override=None)
+                    set_cached_analysis(symbol, result)
+                    try:
+                        process_symbol_result(result, symbol, is_auto=False, all_data=all_data)
+                    except Exception as proc_exc:
+                        add_notification('warning', f"❌ {symbol}: result processing failed: {proc_exc}", symbol=symbol)
+                if i < len(selected_symbols) - 1:
+                    time.sleep(GEMINI_MIN_REQUEST_INTERVAL)
+                progress_bar.progress((i + 1) / len(selected_symbols))
+            progress_bar.empty()
+            st.session_state.last_analysis_time = datetime.now()
+            st.session_state.next_check_time = datetime.now() + timedelta(minutes=ANALYSIS_INTERVAL_MINUTES)
+            add_notification('info', f"✅ Analysis run complete. Next run at {st.session_state.next_check_time.strftime('%H:%M:%S')}.")
+    except Exception as e:
+        add_notification('warning', f"Analysis run failed: {str(e)}")
+        st.error(f"Analysis run failed: {str(e)}")
+# WATCHDOG: clear a stale in-progress flag so scheduled analysis can never be blocked forever.
+if st.session_state.get('analysis_in_progress'):
+    _run_started = st.session_state.get('analysis_started_at')
+    if _run_started is None or (datetime.now() - _run_started).total_seconds() > 900:
+        st.session_state.analysis_in_progress = False
+        add_notification('warning', '🔄 Watchdog cleared a stale analysis-in-progress flag.')
     if st.session_state.bot_running:
         if st.session_state.analysis_in_progress:
             st.info("🔄 Analysis is already in progress. Refreshing status and countdown...")
