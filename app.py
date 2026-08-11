@@ -846,6 +846,20 @@ def normalize_analysis_signals(analysis):
     return analysis
 
 
+def sanitize_news_event_analysis(analysis):
+    if not isinstance(analysis, dict):
+        return analysis
+    for key in [
+        'entry', 'stop_loss', 'take_profit', 'order_type', 'order_description',
+        'order_blocks', 'fvgs', 'sweeps', 'candidate_levels', 'levels_source',
+        'market_state', 'setup_context', 'validation_detail', 'confluence_breakdown',
+        'order_description', 'order_type'
+    ]:
+        analysis.pop(key, None)
+    analysis['is_news_signal'] = True
+    return analysis
+
+
 def cross_check_ai_evidence(analysis):
     ev = analysis.get('directional_evidence')
     if not isinstance(ev, dict):
@@ -2124,7 +2138,7 @@ def run_news_analysis_cycle(event, all_data, symbols):
             results[symbol] = {'signal': 'SKIPPED', 'reason': 'Gemini rate limit'}
             continue
 
-        results[symbol] = analysis
+        results[symbol] = sanitize_news_event_analysis(analysis)
 
     st.session_state.news_event_results[eid] = {
         'event': event,
