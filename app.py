@@ -98,7 +98,7 @@ def parse_news_payload(payload, reference_dt=None, lookahead_hours=72, only_high
         if event_dt > reference_dt + timedelta(hours=lookahead_hours):
             continue
         minutes_until = int((event_dt - reference_dt).total_seconds() // 60)
-        events.append({"event": str(item.get("event") or item.get("title") or "Economic Event").strip(), "currency": str(item.get("country") or item.get("currency") or item.get("pair") or "USD").strip(), "impact": "HIGH" if impact == "HIGH" else "MEDIUM", "time": event_dt.strftime("%Y-%m-%d %H:%M UTC"), "event_time_utc": event_dt, "minutes_until": minutes_until, "within_2h": minutes_until <= 120 and minutes_until >= 0, "timezone": item.get("timezone") or item.get("tz") or item.get("timeZone") or "UTC", "actual": str(item.get("actual") or "N/A").strip(), "previous": str(item.get("previous") or "N/A").strip(), "forecast": str(item.get("forecast") or "N/A").strip()})
+        events.append({"event": str(item.get("event") or item.get("title") or "Economic Event").strip(), "currency": str(item.get("country") or item.get("currency") or item.get("pair") or "USD").strip(), "impact": "HIGH" if impact == "HIGH" else "MEDIUM", "time": event_dt.strftime("%Y-%m-%d %H:%M UTC"), "event_time_utc": event_dt, "minutes_until": minutes_until, "within_2h": minutes_until <= 120 and minutes_until >= 0, "timezone": item.get("timezone") or item.get("tz") or item.get("timeZone") or "UTC"})
     events.sort(key=lambda e: e["event_time_utc"])
     return events
 
@@ -121,16 +121,13 @@ def build_news_context(events, reference_dt=None):
     else:
         bias = "neutral"
         pre_news_bias = "No imminent high-impact event in the next 2 hours."
-    return {"within_2h": bool(within_2h), "bias": bias, "upcoming_count": len(upcoming), "next_event": next_event, "pre_news_bias": pre_news_bias,
-"summary": "\n".join([f"- {e['time']} | {e['currency']} | {e['event']}" for e in upcoming[:5]])}
-
+    return {"within_2h": bool(within_2h), "bias": bias, "upcoming_count": len(upcoming), "next_event": next_event, "pre_news_bias": pre_news_bias, "summary": "\n".join([f"- {e['time']} | {e['currency']} | {e['event']}" for e in upcoming[:5]])}
 
 def format_news_summary(events, limit=5):
     if not events:
         return "No high-impact news in the upcoming window."
     items = events[:limit]
     return "\n".join([f"- {e['time']} {e['currency']}: {e['event']}" for e in items])
-    
 
 def format_east_africa_time(dt):
     try:
@@ -446,10 +443,10 @@ def get_live_price_for_symbol(symbol):
     return None
 
 def fetch_trusted_spot(symbol):
-    """STRATEGY-ENGINE-V2: multi-source spot with AGREEMENT filter.
-    Returns a price only when at least two independent feeds agree within 0.35%.
-    A single rogue/stale feed can no longer displace the tape."""
+    """Multi-source live spot consensus (median of independent feeds).
+    This is the clean, broker-grade reference price used for all levels."""
     readings = []
+
     def push(value):
         try:
             v = float(value)
@@ -457,6 +454,7 @@ def fetch_trusted_spot(symbol):
                 readings.append(v)
         except Exception:
             pass
+
     if symbol == 'XAUUSD':
         push((_request_json('https://api.gold-api.com/price/XAU', timeout=10) or {}).get('price'))
         try:
@@ -477,6 +475,8 @@ def fetch_trusted_spot(symbol):
     elif symbol == 'EURUSD':
         push(((_request_json('https://api.frankfurter.app/latest?from=EUR&to=USD', timeout=10) or {}).get('rates') or {}).get('USD'))
         push((_request_json('https://api.binance.com/api/v3/ticker/price?symbol=EURUSDT', timeout=10) or {}).get('price'))
+
+    # Independent extra reading from Yahoo fast_info (mapped symbol).
     if yf is not None:
         try:
             ticker = yf.Ticker(YFINANCE_MAP.get(symbol, symbol))
@@ -487,14 +487,11 @@ def fetch_trusted_spot(symbol):
                     break
         except Exception:
             pass
-    if len(readings) < 2:
+
+    if not readings:
         return None
     readings.sort()
-    median = readings[len(readings) // 2]
-    agreed = [r for r in readings if abs(r - median) / median <= 0.0035]
-    if len(agreed) < 2:
-        return None
-    return sum(agreed) / len(agreed)
+    return readings[len(readings) // 2]
 
 
 def align_df_to_spot(df, spot, max_dev_pct=0.004):
@@ -541,20 +538,18 @@ def get_latest_quote(symbol):
     return None
 
 def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
-    """STRATEGY-ENGINE-V2: snapshot carries a confidence score used to gate signals."""
+    """The trusted spot consensus is authoritative. Candles are rebased to it
+    inside analyze_symbol_premium, so levels always match the real market."""
     fallback_price = None
     if fallback_df is not None and not fallback_df.empty:
         fallback_price = float(fallback_df['Close'].iloc[-1])
     price = fetch_trusted_spot(symbol)
-    confidence = 1.0 if price is not None else 0.0
     if price is None:
         price = get_latest_quote(symbol)
-        confidence = 0.7 if price is not None else 0.0
     if price is None:
         price = fallback_price
-        confidence = 0.3 if price is not None else 0.0
-    return {'symbol': symbol, 'price': price, 'confidence': confidence,
-            'source': 'live' if confidence >= 0.7 else 'fallback'}
+    return {'symbol': symbol, 'price': price,
+            'source': 'live' if price is not None and fallback_price is not None and price != fallback_price else 'fallback'}
 
 
 def calculate_atr(df, period=14):
@@ -1310,10 +1305,6 @@ STRUCTURAL SCORE (PYTHON):
 {structural_score_context}
 PYTHON DIRECTIONAL LEDGER (REFERENCE EVIDENCE):
 {directional_ledger}
-PYTHON STRATEGY VOTES (MANDATORY REFERENCE):
-{strategy_votes}
-LIVE DATA CONFIDENCE (0-1):
-{data_confidence}
 FIRM DESK BIAS (PYTHON, HTF-FIRST WITH HYSTERESIS):
 {firm_bias}
 MAX ENTRY DISTANCE FROM LIVE PRICE:
@@ -1355,12 +1346,6 @@ MANDATORY ANALYSIS RULES:
 19. If DXY contradicts, it lowers confidence but does not by itself flip a direction decided by rule 15.
 20. INTERNAL CONSISTENCY (MANDATORY): the numbers in "entry", "stop_loss", "take_profit" MUST be the exact levels you discuss in "reasoning" and "order_description".
 21. ENTRY PROXIMITY (HARD RULE): your "entry" MUST be within the stated MAX ENTRY DISTANCE of the live price. If no valid setup can be placed within that distance, output WAIT.
-22. STRATEGY CONFLUENCE (HARD RULE): output BUY/SELL ONLY when the PYTHON STRATEGY VOTES show at least 2 votes supporting that direction and net opposition <= 0. Cite the supporting strategies in "reasoning".
-23. NO COUNTER-TREND TRADES unless the votes contain an smc_reversal vote in your direction (sweep + rejection/divergence).
-24. NO TRADES when the market phase is coiling or RVOL < 0.5 unless 3+ strategies agree.
-25. ENTRY AT STRUCTURE: if price is not already at a demand/supply zone, prefer a LIMIT entry at the zone; never chase price with a MARKET order.
-26. REASONING must cite: HTF bias, the agreeing strategy votes, the entry anchor, the invalidation level and the target level.
-27. WHEN IN DOUBT, OUTPUT WAIT. A missed trade costs nothing; a guessed trade costs the stop.
 OUTPUT JSON ONLY (NO MARKDOWN):
 {{
     "market_state": "continuation|reversal|exhaustion|trend|coiling",
@@ -1381,7 +1366,6 @@ OUTPUT JSON ONLY (NO MARKDOWN):
     "stop_anchor": "swing low / order block low / FVG bottom / invalidation level",
     "tp_anchor": "swing high / supply zone / FVG top / session high",
     "order_expiry": "until next H1 close / until structure invalidates / good till cancelled",
-  "strategy_votes_agreement": ["list the strategy names that support your signal"],
     "order_description": "Brief execution plan using the SAME numbers as entry/stop_loss/take_profit.",
     "confluence_breakdown": "A short explanation of the weighting behind the score using DXY, RSI, VWAP, RVOL, structure, premium/discount, and market phase.",
     "reasoning": "A detailed, confident, pair-specific institutional brief (min 120 words) showing HTF structure, manipulation reads, divergences, DXY, volatility, and exact invalidation/target logic.",
@@ -1391,94 +1375,109 @@ OUTPUT JSON ONLY (NO MARKDOWN):
 
 # FIX: News prompt now asks for direction-only (no Entry/SL/TP) and asks AI to use historical patterns + consensus expectations.
 def build_news_analysis_prompt():
-    return """You are an elite institutional macro-economist and news-trading specialist. Your task is to analyze high-impact USD-sensitive news events and determine the exact directional edge for XAUUSD, EURUSD, BTCUSD, and US30 AT THE TIME of the release.
-    
-    ═══════════════════════════════════════════════════════════════════════════════
-    SYSTEMATIC NEWS ANALYSIS FRAMEWORK (MANDATORY):
-    ═══════════════════════════════════════════════════════════════════════════════
-    LAYER 1 - DATA & SURPRISE EVALUATION:
-    - Examine the provided Previous, Forecast (Consensus), and Actual numbers in the NEWS EVENT DETAILS.
-    - Calculate the SURPRISE component: Did the Actual beat or miss the Forecast? By how much?
-    - If Actual is "N/A" (pre-release), you must project the likely market reaction based on the CURRENT consensus expectation and how the market is positioned for a beat/miss.
-    - How does this specific surprise (or expected surprise) affect US Dollar (DXY) strength? (e.g., Higher rates/NFP/CPI = Stronger USD = Bearish for XAU/EUR/BTC).
-    
-    LAYER 2 - HISTORICAL CONTEXT & PAIR SENSITIVITY:
-    - Recall how this specific event historically impacts each pair.
-    - XAUUSD: Highly sensitive to real yields and USD strength.
-    - EURUSD: Direct inverse of DXY.
-    - BTCUSD: Risk-on asset, sensitive to USD liquidity and yield curves.
-    - US30: Equity index, sensitive to growth vs. rate expectations.
-    
-    LAYER 3 - CURRENT MARKET POSITIONING (PRE-NEWS):
-    - Analyze the provided HTF trend, structural score, and premium/discount positioning.
-    - Is the market already pricing in the consensus? (e.g., if Gold is rallying into a CPI print, it expects a low CPI. A high CPI will cause a massive reversal).
-    - Identify the "Trap" potential: Will the initial spike be a liquidity sweep before the real move?
-    
-    LAYER 4 - SYNTHESIS & DIRECTIONAL EDGE:
-    - Combine the Data Surprise + Historical Pair Sensitivity + Current Positioning.
-    - Determine the definitive BUY or SELL direction for EACH symbol.
-    - NEVER output WAIT for a news signal. You MUST take a stance based on the macroeconomic mechanics of the release.
-    
-    DATA PROVIDED:
-    {data_summary}
-    MICROSTRUCTURE (M10):
-    {microstructure_data}
-    STRUCTURE CONTEXT:
-    {structure_context}
-    RSI VALUES (MULTI-TIMEFRAME):
-    {rsi_values}
-    PREMIUM/DISCOUNT POSITION:
-    {premium_discount}
-    VOLATILITY (ATR):
-    {volatility_context}
-    HTF CONTEXT (H1/H4):
-    {htf_context}
-    DXY (US Dollar Index) TREND:
-    {dxy_data}
-    HISTORICAL CONTEXT:
-    {historical_context}
-    NEWS EVENT DETAILS (WITH PREVIOUS, FORECAST, ACTUAL):
-    {news_summary}
-    STRUCTURAL SCORE (PYTHON):
-    {structural_score_context}
-    PYTHON STRATEGY VOTES:
-    {strategy_votes}
-    
-    ═══════════════════════════════════════════════════════════════════════════════
-    MANDATORY OUTPUT RULES:
-    ═══════════════════════════════════════════════════════════════════════════════
-    1. Your "reasoning" MUST explicitly cite the Previous, Forecast, and Actual numbers provided in the NEWS EVENT DETAILS.
-    2. Your "reasoning" MUST explain the macroeconomic mechanism (e.g., "Actual NFP beat forecast by 50k, signaling labor market heat, pushing US10Y yields up, strengthening DXY, therefore SELL XAUUSD").
-    3. If Actual is "N/A", you MUST state: "Pre-release analysis: Market expects X. If Actual > Forecast, the reaction will be Y. If Actual < Forecast, the reaction will be Z. Based on current HTF positioning, the desk is positioned for [Direction]."
-    4. Fill "directional_evidence" with the macro facts and structural alignments.
-    5. DO NOT output Entry/SL/TP. Output ONLY the direction and the deep macro reasoning.
-    6. Minimum 250 words for reasoning. Be highly specific, institutional, and decisive.
-    
-    OUTPUT JSON ONLY (NO MARKDOWN):
-    {{
-      "market_state": "continuation|reversal|exhaustion|trend|coiling",
-      "bias": "BULLISH|BEARISH|RANGING",
-      "signal": "BUY|SELL",
-      "confluence_score": 0,
-      "confidence": "HIGH|MEDIUM|LOW",
-      "dxy_correlation": "CONFIRMING|CONTRADICTING|NEUTRAL",
-      "microstructure_read": "Brief summary of VWAP/RVOL status",
-      "pre_news_bias": "Detailed explanation of expected USD impact, the surprise component, and pair reaction",
-      "directional_evidence": {{"bullish": ["..."], "bearish": ["..."]}},
-      "historical_pattern": "How this specific event historically impacts XAU, EUR, BTC, US30",
-      "current_positioning": "How the current chart structure is positioned for the consensus vs the surprise",
-      "news_impact_mechanics": "The exact macroeconomic transmission mechanism from the data print to the asset price",
-      "reasoning": "Complete synthesis citing the EXACT numbers (Previous/Forecast/Actual) and the macro mechanism (min 250 words).",
-      "rejection_reason": "If WAIT, detailed explanation (Note: WAIT is forbidden for news signals)"
-    }}
-    """
+    return """You are an elite news-driven macro analyst operating with the discipline of a professional trading desk. You analyze high-impact USD-sensitive news BEFORE it is released using a SYSTEMATIC MULTI-LAYER ANALYSIS to project how the event will affect trading pairs AT THE TIME of the news reading.
 
+═══════════════════════════════════════════════════════════════════════════════
+SYSTEMATIC ANALYSIS FRAMEWORK (FOLLOW IN ORDER):
+═══════════════════════════════════════════════════════════════════════════════
+
+LAYER 1 - HISTORICAL RELEASE PATTERN ANALYSIS:
+- Recall the LAST 3-4 RELEASES of this specific event type
+- For each release: What was the previous value? What was the consensus? What was the actual? What was the surprise?
+- How did the market react to each surprise? (direction, magnitude, duration)
+- What is the typical consensus expectation for THIS release?
+- What would constitute a surprise vs consensus for THIS release?
+
+LAYER 2 - CURRENT MARKET POSITIONING ANALYSIS:
+- Analyze the CURRENT MARKET STRUCTURE provided (structure context, HTF context)
+- Where is price positioned relative to key levels? (premium/discount, key support/resistance)
+- What is the current momentum and trend across timeframes?
+- What is the current RSI positioning across timeframes?
+- What is the current DXY trend and positioning?
+- Based on current positioning, is the market positioned FOR or AGAINST the expected news outcome?
+
+LAYER 3 - NEWS IMPACT MECHANICS:
+- How does THIS specific event type typically affect the US Dollar?
+- How does THIS specific event type typically affect EACH SYMBOL (XAUUSD, EURUSD, BTCUSD, US30)?
+- What is the typical reaction pattern? (immediate spike, delayed reaction, fade, continuation)
+- What time of day is the release? (affects liquidity and reaction magnitude)
+- What is the current market session? (affects liquidity and reaction magnitude)
+
+LAYER 4 - CROSS-ASSET CORRELATION ANALYSIS:
+- How do different symbols typically react to THIS event type?
+- Are there any cross-asset correlations that confirm or contradict the expected move?
+- Are there any divergences between assets that suggest a specific outcome?
+
+LAYER 5 - SYNTHESIS AND DIRECTIONAL EDGE:
+- Combine all layers to determine the EXPECTED NEWS OUTCOME (stronger/weaker USD)
+- Determine the EXPECTED SYMBOL REACTION for each symbol
+- Determine if current positioning is FOR or AGAINST the expected outcome
+- Determine the directional edge: Should the trader be positioned LONG or SHORT when the news drops?
+
+DATA PROVIDED:
+{data_summary}
+MICROSTRUCTURE (M10):
+{microstructure_data}
+STRUCTURE CONTEXT:
+{structure_context}
+RSI VALUES (MULTI-TIMEFRAME):
+{rsi_values}
+PREMIUM/DISCOUNT POSITION:
+{premium_discount}
+VOLATILITY (ATR):
+{volatility_context}
+HTF CONTEXT (H1/H4):
+{htf_context}
+DXY (US Dollar Index) TREND:
+{dxy_data}
+HISTORICAL CONTEXT:
+{historical_context}
+NEWS EVENT DETAILS:
+{news_summary}
+STRUCTURAL SCORE (PYTHON):
+{structural_score_context}
+PYTHON DIRECTIONAL LEDGER (REFERENCE EVIDENCE):
+{directional_ledger}
+
+═══════════════════════════════════════════════════════════════════════════════
+MANDATORY ANALYSIS RULES:
+═══════════════════════════════════════════════════════════════════════════════
+
+1. COMPLETE ALL 5 LAYERS OF ANALYSIS before determining the final signal
+2. For EACH SYMBOL, determine:
+   - Expected USD impact (stronger/weaker/neutral)
+   - Expected symbol reaction (up/down/neutral)
+   - Current positioning (for/against the expected move)
+   - Final directional edge (long/short/neutral)
+3. Be SPECIFIC about historical patterns - cite specific previous releases and reactions
+4. ALWAYS USE THE PROVIDED HISTORICAL CONTEXT: explicitly cite the last 3-4 releases (previous, consensus, actual, surprise) from the `HISTORICAL CONTEXT` field included in the DATA PROVIDED. If precise release numbers are not available in the field, state that explicitly and infer the pattern from the summary.
+4. Be SPECIFIC about current positioning - cite specific levels and indicators
+5. Be SPECIFIC about the expected reaction - cite the mechanism and timing
+6. Output BUY or SELL when there is a clear directional edge
+7. NEVER output WAIT for a news signal. Always pick BUY or SELL with detailed reasoning.
+8. DO NOT output Entry, SL, or TP levels - focus ONLY on direction and reasoning
+9. Write DETAILED reasoning (minimum 200 words) that shows your complete analysis process
+
+OUTPUT JSON ONLY (NO MARKDOWN):
+{{
+    "market_state": "continuation|reversal|exhaustion|trend|coiling",
+    "bias": "BULLISH|BEARISH|RANGING",
+    "signal": "BUY|SELL",
+    "confluence_score": 0,
+    "confidence": "HIGH|MEDIUM|LOW",
+    "dxy_correlation": "CONFIRMING|CONTRADICTING|NEUTRAL",
+    "microstructure_read": "Brief summary of VWAP/RVOL status",
+    "pre_news_bias": "Detailed explanation of expected USD impact and symbol reaction",
+    "directional_evidence": {{"bullish": ["..."], "bearish": ["..."]}},
+    "historical_pattern": "Detailed analysis of last 3-4 releases: previous values, consensus, actual, surprises, and market reactions",
+    "current_positioning": "Detailed analysis of current market positioning relative to expected news outcome",
+    "news_impact_mechanics": "Detailed explanation of how this event type affects USD and each symbol, including typical reaction patterns and timing",
+    "reasoning": "Complete synthesis of all 5 layers showing your complete analysis process (minimum 200 words)",
+    "rejection_reason": "If WAIT, detailed explanation of why there is no clear directional edge"
+}}
+"""
 
 MINIMUM_CONFLUENCE_SCORE = 70
-LIVE_SIGNAL_MIN_SCORE = 74
-OPPOSITE_SIGNAL_LOCK_MINUTES = 90
-MIN_STRATEGY_AGREEMENT = 2
-DATA_CONFIDENCE_MIN = 0.5
 ANALYSIS_INTERVAL_MINUTES = 5
 NEWS_PRE_WINDOW_HOURS = 2
 
@@ -1626,7 +1625,6 @@ def build_telegram_signal_message(symbol, result):
 
     reasoning = _escape_telegram_html(result.get('reasoning'))
     order_type = _escape_telegram_html(result.get('order_type', 'MARKET'))
-
 
     return (
         f"🌍 <b>DER-AI MACRO SIGNAL</b>\n"
@@ -2046,8 +2044,8 @@ def get_high_impact_news(selected_symbols=None, reference_dt=None):
             # FIX: only_high=False to include MEDIUM USD-sensitive events
             events = parse_news_payload(payload, reference_dt=reference_dt, lookahead_hours=168, only_high=False)
             if events:
-                filtered_events = filter_relevant_news([{'event': e['event'], 'currency': e['currency'], 'impact': e['impact'], 'time': e['time'], 'event_time_utc': e['event_time_utc'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone'], 'actual': e.get('actual', 'N/A'), 'previous': e.get('previous', 'N/A'), 'forecast': e.get('forecast', 'N/A')} for e in events], selected_symbols=selected_symbols, reference_dt=reference_dt)
-                return [{'time': format_east_africa_time(e['event_time_utc']), 'currency': e['currency'], 'event': e['event'], 'impact': e['impact'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone'], 'event_time_utc': e['event_time_utc'], 'event_id': f"{e['event']}|{e['currency']}|{e['event_time_utc'].strftime('%Y-%m-%d %H:%M:%S')}", 'actual': e.get('actual', 'N/A'), 'previous': e.get('previous', 'N/A'), 'forecast': e.get('forecast', 'N/A')} for e in filtered_events]
+                filtered_events = filter_relevant_news([{'event': e['event'], 'currency': e['currency'], 'impact': e['impact'], 'time': e['time'], 'event_time_utc': e['event_time_utc'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone']} for e in events], selected_symbols=selected_symbols, reference_dt=reference_dt)
+                return [{'time': format_east_africa_time(e['event_time_utc']), 'currency': e['currency'], 'event': e['event'], 'impact': e['impact'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone'], 'event_time_utc': e['event_time_utc'], 'event_id': f"{e['event']}|{e['currency']}|{e['event_time_utc'].strftime('%Y-%m-%d %H:%M:%S')}"} for e in filtered_events]
         except Exception as exc:
             print(f"⚠️ News fetch failed for {url}: {exc}")
     return []
@@ -2070,28 +2068,6 @@ def update_news_event_status(event, status, detail=None):
         return
     event_id = event.get('event_id') or f"{event.get('event')}|{event.get('currency')}|{event.get('time')}"
     st.session_state.news_event_statuses[event_id] = {'event': event.get('event'), 'currency': event.get('currency'), 'time': event.get('time'), 'status': status, 'detail': detail or ''}
-
-
-# ── NEWS-ENGINE-V2: Hard gate to ensure AI actually analyzes the macro data ────
-def validate_news_reasoning(analysis, news_override):
-    """NEWS-ENGINE-V2: Ensure the AI actually cited the news data and macro mechanics."""
-    if not news_override:
-        return analysis
-    reasoning = (analysis.get('reasoning') or '').lower()
-    news = news_override[0]
-    prev = str(news.get('previous', 'N/A')).lower()
-    fore = str(news.get('forecast', 'N/A')).lower()
-    act = str(news.get('actual', 'N/A')).lower()
-    
-    has_data_citation = any(x in reasoning for x in [prev, fore, act, 'previous', 'forecast', 'actual', 'consensus', 'surprise', 'expectation'])
-    has_macro_mechanism = any(x in reasoning for x in ['dxy', 'dollar', 'yields', 'rates', 'inflation', 'growth', 'liquidity', 'risk-on', 'risk-off', 'usd', 'fed'])
-    
-    if not has_data_citation or not has_macro_mechanism:
-        analysis['signal'] = 'WAIT'
-        analysis['confidence'] = 'LOW'
-        analysis['rejection_reason'] = 'News AI failed to cite the specific data numbers (Previous/Forecast/Actual) or the macroeconomic transmission mechanism. Refusing to guess.'
-        analysis['confluence_score'] = 0
-    return analysis
 
 # ── Dedicated Pre-News Impact Engine (sent ONCE, >=2h ahead, Calendar+Telegram only) ──
 def wait_for_GEMINI_spacing():
@@ -2237,15 +2213,8 @@ def run_news_analysis_cycle(event, all_data, symbols):
             results[symbol] = {'signal': 'SKIPPED', 'reason': 'Gemini rate limit'}
             continue
 
-        # --- MANUAL PATCH: RUN NEWS REASONING VALIDATOR ---
-        # Pass the event as a list to the validator. It will automatically 
-        # change the signal to 'WAIT' if the AI hallucinates the news data.
-        analysis = validate_news_reasoning(analysis, [event])
-        # --------------------------------------------------
-
         results[symbol] = sanitize_news_event_analysis(analysis)
 
-       
     st.session_state.news_event_results[eid] = {
         'event': event,
         'results': results,
@@ -2305,7 +2274,7 @@ def run_news_analysis_cycle(event, all_data, symbols):
 GEMINI_MIN_REQUEST_INTERVAL = 3
 GEMINI_TOKEN_LIMIT_PER_MINUTE = 500000
 GEMINI_ESTIMATED_RESPONSE_TOKENS = 600
-GEMINI_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+GEMINI_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"]
 
 def estimate_tokens_for_text(text):
     return max(1, int(len(text) / 4))
@@ -2470,165 +2439,6 @@ def call_gpt(system_prompt, user_content, max_tokens=2000, retry_count=0, estima
                 return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": f"Error: {str(e)}", "estimated_tokens": estimated_tokens}
             continue
     return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "Error: all Gemini models failed.", "estimated_tokens": estimated_tokens}
-
-# STRATEGY-ENGINE-V2 marker
-# ── STRATEGY-ENGINE-V2: multi-strategy confluence, gates, zone entries ───────
-def _vote(direction, strength, reason):
-    return {'direction': direction, 'strength': strength, 'reason': reason}
-
-def build_strategy_votes(m10, swings, current_price, htf_bias=None, dxy_context=None, order_blocks=None, fvgs=None):
-    """Six independent strategies vote BUY/SELL/FLAT. No single indicator can trigger a trade."""
-    votes = {}
-    micro = calculate_microstructure(m10)
-    sweeps = detect_liquidity_sweeps(m10)
-    divergence = detect_rsi_divergence(m10)
-    reversal = detect_reversal(m10)
-    continuation = detect_continuation(m10)
-    pos_info = range_position(m10, current_price)
-    # 1) HTF trend-follow
-    if htf_bias == 'BULLISH':
-        votes['trend_follow'] = _vote('BUY', 2, 'H1/H4 trend bullish')
-    elif htf_bias == 'BEARISH':
-        votes['trend_follow'] = _vote('SELL', 2, 'H1/H4 trend bearish')
-    else:
-        votes['trend_follow'] = _vote('FLAT', 0, 'HTF neutral')
-    # 2) SMC sweep + rejection/divergence reversal
-    bull_sweep = any(s['type'] == 'BULLISH_SWEEP' for s in sweeps[-2:])
-    bear_sweep = any(s['type'] == 'BEARISH_SWEEP' for s in sweeps[-2:])
-    bull_conf = (divergence and divergence['type'] == 'BULLISH_DIV') or (reversal and reversal.get('direction') == 'BUY')
-    bear_conf = (divergence and divergence['type'] == 'BEARISH_DIV') or (reversal and reversal.get('direction') == 'SELL')
-    if bull_sweep and bull_conf:
-        votes['smc_reversal'] = _vote('BUY', 2, 'swept lows reclaimed with rejection/divergence')
-    elif bear_sweep and bear_conf:
-        votes['smc_reversal'] = _vote('SELL', 2, 'swept highs rejected with rejection/divergence')
-    else:
-        votes['smc_reversal'] = _vote('FLAT', 0, 'no sweep+rejection setup')
-    # 3) VWAP momentum
-    if micro.get('momentum') == 'BULLISH' and micro.get('price_vs_vwap') == 'ABOVE':
-        votes['vwap_momentum'] = _vote('BUY', 1, 'price above VWAP with bullish momentum')
-    elif micro.get('momentum') == 'BEARISH' and micro.get('price_vs_vwap') == 'BELOW':
-        votes['vwap_momentum'] = _vote('SELL', 1, 'price below VWAP with bearish momentum')
-    else:
-        votes['vwap_momentum'] = _vote('FLAT', 0, 'VWAP mixed')
-    # 4) Range premium/discount mean-reversion
-    if pos_info:
-        pos, lo, hi = pos_info
-        if pos <= 0.35:
-            votes['range_position'] = _vote('BUY', 1, 'discount zone favors longs')
-        elif pos >= 0.65:
-            votes['range_position'] = _vote('SELL', 1, 'premium zone favors shorts')
-        else:
-            votes['range_position'] = _vote('FLAT', 0, 'mid-range, no edge')
-    else:
-        votes['range_position'] = _vote('FLAT', 0, 'range unavailable')
-    # 5) Breakout / continuation
-    if continuation and continuation.get('direction') == 'BUY':
-        votes['breakout'] = _vote('BUY', 2, 'continuation break to the upside')
-    elif continuation and continuation.get('direction') == 'SELL':
-        votes['breakout'] = _vote('SELL', 2, 'continuation break to the downside')
-    else:
-        votes['breakout'] = _vote('FLAT', 0, 'no breakout')
-    # 6) DXY macro filter
-    if dxy_context and dxy_context.get('trend') == 'BEARISH' and dxy_context.get('price_vs_vwap') == 'BELOW':
-        votes['dxy_macro'] = _vote('BUY', 1, 'DXY weakness supports longs')
-    elif dxy_context and dxy_context.get('trend') == 'BULLISH' and dxy_context.get('price_vs_vwap') == 'ABOVE':
-        votes['dxy_macro'] = _vote('SELL', 1, 'DXY strength supports shorts')
-    else:
-        votes['dxy_macro'] = _vote('FLAT', 0, 'DXY neutral')
-    return votes
-
-def strategy_confluence(votes, direction):
-    agree = [v for v in (votes or {}).values() if v['direction'] == direction]
-    strong = [v for v in agree if v['strength'] >= 2]
-    oppose = [v for v in (votes or {}).values() if v['direction'] not in (direction, 'FLAT')]
-    return {'agree': len(agree), 'strong': len(strong), 'oppose': len(oppose), 'net': len(agree) - len(oppose)}
-
-def apply_signal_quality_gate(analysis, votes, phase_context, micro, htf_bias, symbol=None, data_confidence=1.0):
-    """STRATEGY-ENGINE-V2 hard gates. Anything doubtful becomes WAIT instead of a gamble."""
-    signal = analysis.get('signal')
-    if signal not in ('BUY', 'SELL'):
-        return analysis
-    conf = strategy_confluence(votes, signal)
-    phase = (phase_context or {}).get('phase')
-    rvol = (micro or {}).get('rvol', 1.0)
-    reversal_conf = bool(votes and votes.get('smc_reversal', {}).get('direction') == signal)
-    if data_confidence < DATA_CONFIDENCE_MIN:
-        analysis['signal'] = 'WAIT'
-        analysis['confidence'] = 'LOW'
-        analysis['rejection_reason'] = 'Low data confidence: live spot feeds disagree or are missing; standing aside.'
-        return analysis
-    if phase == 'coiling' and conf['strong'] < 2:
-        analysis['signal'] = 'WAIT'
-        analysis['confidence'] = 'LOW'
-        analysis['rejection_reason'] = 'Market is coiling; no structural edge, refusing to guess.'
-        return analysis
-    if htf_bias in ('BULLISH', 'BEARISH') and signal != htf_bias and not reversal_conf:
-        analysis['signal'] = 'WAIT'
-        analysis['confidence'] = 'LOW'
-        analysis['rejection_reason'] = f'Counter-trend {signal} vs {htf_bias} HTF without sweep+rejection confirmation; standing aside.'
-        return analysis
-    if rvol < 0.5 and conf['agree'] < 3:
-        analysis['signal'] = 'WAIT'
-        analysis['confidence'] = 'LOW'
-        analysis['rejection_reason'] = f'Thin volume (RVOL {rvol:.2f}); conviction insufficient without 3+ strategy votes.'
-        return analysis
-    if conf['agree'] < MIN_STRATEGY_AGREEMENT or conf['net'] <= 0:
-        analysis['signal'] = 'WAIT'
-        analysis['confidence'] = 'LOW'
-        analysis['rejection_reason'] = f'Only {conf["agree"]} strateg(ies) support {signal}; need {MIN_STRATEGY_AGREEMENT}+ agreeing with positive net.'
-        return analysis
-    last = st.session_state.active_signals.get(symbol or analysis.get('symbol'))
-    if last and last.get('direction') not in (None, signal):
-        age_min = (datetime.now() - last['timestamp']).total_seconds() / 60.0
-        if age_min < OPPOSITE_SIGNAL_LOCK_MINUTES and not reversal_conf:
-            analysis['signal'] = 'WAIT'
-            analysis['confidence'] = 'LOW'
-            analysis['rejection_reason'] = f'Opposite {last["direction"]} signal active {age_min:.0f}m ago; no structural break confirmed, no flip-flopping.'
-            return analysis
-    floor = LIVE_SIGNAL_MIN_SCORE if not reversal_conf else MINIMUM_CONFLUENCE_SCORE + 2
-    if analysis.get('confluence_score', 0) < floor and conf['agree'] < 3:
-        analysis['signal'] = 'WAIT'
-        analysis['confidence'] = 'LOW'
-        analysis['rejection_reason'] = f'Score {analysis.get("confluence_score", 0)} below live-signal floor {floor}.'
-        return analysis
-    analysis['confluence_score'] = min(100, max(analysis.get('confluence_score', 0), 70 + 3 * conf['agree'] + 2 * conf['strong']))
-    return analysis
-
-def maybe_convert_to_limit_order(analysis, votes, swings, order_blocks, fvgs, current_price, atr, pair_config):
-    """STRATEGY-ENGINE-V2: never chase price. Enter at the zone (LIMIT) or stand aside."""
-    signal = analysis.get('signal')
-    if signal not in ('BUY', 'SELL'):
-        return analysis
-    if str(analysis.get('order_type', '') or '').upper() in ('LIMIT', 'STOP'):
-        return analysis
-    try:
-        current_price = float(current_price)
-    except Exception:
-        return analysis
-    tick = float(pair_config.get('tick_size', 0.01) or 0.01)
-    atr_v = float(atr or 0) or (current_price * 0.002)
-    tolerance = max(tick * 3.0, atr_v * 0.25)
-    max_gap = min(
-        float(pair_config.get('max_entry_points', 10) or 10),
-        current_price * float(pair_config.get('max_entry_gap_pct', 0.003) or 0.003),
-        atr_v * float(pair_config.get('limit_zone_atr', 0.9) or 0.9)
-    )
-    anchor = get_entry_anchor(signal, current_price, swings, order_blocks, fvgs)
-    if anchor is None:
-        return analysis
-    dist = abs(current_price - anchor)
-    if dist <= tolerance:
-        return analysis
-    if dist <= max_gap:
-        analysis['entry'] = round_price(anchor, pair_config)
-        analysis['order_type'] = 'LIMIT'
-        analysis['reasoning'] = (analysis.get('reasoning', '') + f' Entry placed as LIMIT at the {signal} zone {round(anchor, 2)} instead of chasing price.').strip()
-    else:
-        analysis['signal'] = 'WAIT'
-        analysis['confidence'] = 'LOW'
-        analysis['rejection_reason'] = 'No quality entry zone within reach; refusing to chase price.'
-    return analysis
-
 
 # ── Level Enforcement ─────────────────────────────────────────────────────────
 def round_price(price, pair_config):
@@ -3400,95 +3210,59 @@ def apply_dxy_guardrails(analysis, symbol, dxy_context):
     return analysis
 
 def apply_htf_trend_guard(analysis, symbol, htf_context):
-    """STRATEGY-ENGINE-V2: counter-trend signals are BLOCKED unless a sweep+reversal
-    confirmation exists in the reasoning/structure. No more countertrend gambling."""
     if analysis.get('signal') not in ['BUY', 'SELL'] or not isinstance(htf_context, dict):
         return analysis
     trend = str(htf_context.get('trend') or '').upper()
     bias = str(htf_context.get('bias') or '').upper()
-    expected = trend if trend in ('BULLISH', 'BEARISH') else (bias if bias in ('BULLISH', 'BEARISH') else None)
-    if not expected:
+    if trend not in {'BULLISH', 'BEARISH'} and bias not in {'BULLISH', 'BEARISH'}:
         return analysis
+    expected_bias = trend or bias
     signal = analysis.get('signal')
-    if (signal == 'BUY' and expected == 'BEARISH') or (signal == 'SELL' and expected == 'BULLISH'):
-        reasoning = (analysis.get('reasoning') or '').lower()
-        has_conf = any(t in reasoning for t in ['sweep', 'reversal', 'divergence', 'rejection', 'choch'])
-        if not has_conf:
-            analysis['signal'] = 'WAIT'
-            analysis['confidence'] = 'LOW'
-            analysis['confluence_score'] = min(analysis.get('confluence_score', 0), MINIMUM_CONFLUENCE_SCORE)
-            analysis['rejection_reason'] = f'Counter-trend {signal} vs {expected} HTF without sweep/reversal confirmation; standing aside.'
-        else:
-            analysis['confidence'] = 'MEDIUM' if analysis.get('confidence') == 'HIGH' else analysis.get('confidence')
-            analysis['confluence_score'] = min(analysis.get('confluence_score', 0), 78)
-            analysis['reasoning'] = f"{analysis.get('reasoning', '')} Counter-trend idea accepted only because structural reversal confirmation exists; reduced conviction."
+    if (signal == 'BUY' and expected_bias == 'BEARISH') or (signal == 'SELL' and expected_bias == 'BULLISH'):
+        analysis['confidence'] = 'MEDIUM' if analysis.get('confidence') == 'HIGH' else analysis.get('confidence')
+        analysis['confluence_score'] = min(analysis.get('confluence_score', 0), 78)
+        analysis['reasoning'] = f"{analysis.get('reasoning', '')} Note: the higher-timeframe trend is {expected_bias.lower()}, so this countertrend idea carries reduced conviction and needs strong structural confirmation."
     return analysis
 
 # Market fallback uses the desk picture and microstructure to generate a clean, non-news reasoning block.
 def build_market_fallback_analysis(symbol, m10, swings, pair_config, dxy_context, news_context, candles=None, phase_context=None, live_price=None, htf_context=None, picture=None, firm=None, firm_notes=None, learning=None, historical_context=None):
-    """STRATEGY-ENGINE-V2 fallback: only signals when multiple strategies agree AND
-    HTF is aligned AND phase/volume are tradeable. Otherwise it stands aside (WAIT)."""
     current_price = live_price if live_price is not None else float(m10['Close'].iloc[-1])
     micro = calculate_microstructure(m10)
     phase_context = phase_context or detect_market_phase(m10, swings=swings)
     if picture is None:
         picture = build_mtf_picture({'M10': m10}, symbol)
-    htf_bias = (picture or {}).get('htf_bias', 'NEUTRAL')
-    votes = build_strategy_votes(m10, swings, current_price, htf_bias=htf_bias, dxy_context=dxy_context)
-    best_dir, best_conf = None, None
-    for d in ('BUY', 'SELL'):
-        c = strategy_confluence(votes, d)
-        if best_conf is None or (c['agree'], c['strong']) > (best_conf['agree'], best_conf['strong']):
-            best_dir, best_conf = d, c
-    direction = None
-    if best_conf and best_conf['agree'] >= MIN_STRATEGY_AGREEMENT and best_conf['net'] > 0:
-        direction = best_dir
-    if direction and htf_bias in ('BULLISH', 'BEARISH') and direction != htf_bias and (votes.get('smc_reversal') or {}).get('direction') != direction:
-        direction = None
-    if direction and phase_context.get('phase') == 'coiling' and best_conf['strong'] < 2:
-        direction = None
-    if direction and micro.get('rvol', 1.0) < 0.5 and best_conf['agree'] < 3:
-        direction = None
-    vote_summary = '; '.join([f"{k}={v['direction']}" for k, v in votes.items()])
-    if direction is None:
-        return {
-            'bias': htf_bias or 'RANGING',
-            'signal': 'WAIT',
-            'confluence_score': MINIMUM_CONFLUENCE_SCORE,
-            'confidence': 'LOW',
-            'dxy_correlation': 'CONFIRMING' if dxy_context else 'NEUTRAL',
-            'microstructure_read': f"VWAP {micro.get('price_vs_vwap', 'NEUTRAL')} | RVOL {micro.get('rvol', 0):.2f} | Momentum {micro.get('momentum', 'NEUTRAL')}",
-            'pre_news_bias': news_context.get('pre_news_bias', 'N/A'),
-            'reasoning': f"Fallback desk stands aside. Strategy votes: {vote_summary}. Phase: {phase_context.get('phase')}. No multi-strategy confluence; refusing to guess on momentum alone.",
-            'rejection_reason': 'No multi-strategy confluence; refusing to guess on momentum alone.',
-            'structural_score': 55,
-            'score_reason': 'Strategy-engine V2 fallback.',
-            'candidate_direction': best_dir,
-            'levels_source': 'PYTHON',
-            'historical_pattern': historical_context or '',
-        }
+    if firm is None:
+        firm, firm_notes = resolve_firm_direction(symbol, picture)
+    confluence = detect_directional_confluence(m10, swings=swings, htf_context=htf_context, dxy_context=dxy_context, symbol=symbol)
+    direction = normalize_ai_signal(confluence.get('direction') or firm)
+    if direction not in {'BUY', 'SELL'}:
+        direction = 'BUY' if micro.get('momentum') == 'BULLISH' else 'SELL'
     bias = 'BULLISH' if direction == 'BUY' else 'BEARISH'
-    supporting = [f"{k}: {v['reason']}" for k, v in votes.items() if v['direction'] == direction]
-    score = max(MINIMUM_CONFLUENCE_SCORE, min(80, 68 + 3 * best_conf['agree'] + 2 * best_conf['strong']))
-    reasoning = (f"Multi-strategy confluence supports {direction}: " + '; '.join(supporting) +
-                 f". HTF bias {htf_bias}; phase {phase_context.get('phase')}; "
-                 f"microstructure VWAP {micro.get('price_vs_vwap', 'NEUTRAL')}, RVOL {micro.get('rvol', 0):.2f}.")
-    if firm and firm == direction:
-        reasoning += f" Standing desk bias {firm} agrees with the strategy confluence."
+    evidence = confluence.get('bullish_evidence') if direction == 'BUY' else confluence.get('bearish_evidence')
+    reasoning_parts = [f"Fallback market analysis supports {direction}: " + '; '.join(evidence[:6]) + '.']
+    if phase_context.get('phase'):
+        reasoning_parts.append(f"The market phase is {phase_context['phase']}, with {phase_context.get('reason', 'structure being assessed')}.")
+    if firm:
+        reasoning_parts.append(f"Standing desk bias is {firm} based on higher-timeframe alignment and momentum.")
     if historical_context:
-        reasoning += f" Historical price context: {historical_context}"
+        reasoning_parts.append(f"Historical price context: {historical_context}")
+    reasoning_parts.append(f"Microstructure: VWAP {micro.get('price_vs_vwap', 'NEUTRAL')}, RVOL {micro.get('rvol', 0):.2f}, momentum {micro.get('momentum', 'NEUTRAL')}.")
+    if phase_context.get('entry_quality') == 'late':
+        reasoning_parts.append("The entry is late and the move is already underway, so this is a lower-conviction setup.")
+    full_reasoning = ' '.join(reasoning_parts)
+    score = max(MINIMUM_CONFLUENCE_SCORE, min(78, 68 + (2 if abs(picture.get('score', 0)) >= 3 else 0)))
     return {
         'bias': bias,
-        'signal': direction,
+        'signal': normalize_ai_signal(direction),
         'confluence_score': score,
-        'confidence': 'MEDIUM' if best_conf['strong'] >= 2 else 'LOW',
+        'confidence': 'LOW',
         'dxy_correlation': 'CONFIRMING' if dxy_context else 'NEUTRAL',
         'microstructure_read': f"VWAP {micro.get('price_vs_vwap', 'NEUTRAL')} | RVOL {micro.get('rvol', 0):.2f} | Momentum {micro.get('momentum', 'NEUTRAL')}",
         'pre_news_bias': news_context.get('pre_news_bias', 'N/A'),
-        'reasoning': reasoning,
+        'reasoning': full_reasoning,
         'rejection_reason': None,
-        'structural_score': 60 + 5 * best_conf['agree'],
-        'score_reason': 'Strategy-engine V2 fallback.',
+        'structural_score': 60,
+        'score_reason': 'Fallback market model using MTF directional evidence.',
         'candidate_direction': direction,
         'levels_source': 'PYTHON',
         'historical_pattern': historical_context or '',
@@ -3618,13 +3392,9 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         m15_data = data.get('M15', pd.DataFrame())
         m30_data = data.get('M30', pd.DataFrame())
         if news_override:
-            news_payload = [{'event_time_utc': n.get('event_time_utc', datetime.now(timezone.utc) + timedelta(minutes=max(0, n.get('minutes_until', 0)))), 'within_2h': n.get('within_2h', False), 'time': n.get('time', ''), 'currency': n.get('currency', ''), 'event': n.get('event', ''), 'previous': n.get('previous', 'N/A'), 'forecast': n.get('forecast', 'N/A'), 'actual': n.get('actual', 'N/A')} for n in news_override]
+            news_payload = [{'event_time_utc': n.get('event_time_utc', datetime.now(timezone.utc) + timedelta(minutes=max(0, n.get('minutes_until', 0)))), 'within_2h': n.get('within_2h', False), 'time': n.get('time', ''), 'currency': n.get('currency', ''), 'event': n.get('event', '')} for n in news_override]
             nc = build_news_context(news_payload, reference_dt=datetime.now(timezone.utc))
-            news_text = "\n".join([
-            f"- {n.get('time', '')} | {n.get('currency', '')} | {n.get('event', '')} | "
-            f"Previous: {n.get('previous', 'N/A')} | Forecast: {n.get('forecast', 'N/A')} | Actual: {n.get('actual', 'N/A')}"
-            for n in news_payload
-        ])
+            news_text = format_news_summary(news_payload, limit=len(news_payload))
             news_context = {'within_2h': nc.get('within_2h', False), 'bias': nc.get('bias', 'neutral'), 'upcoming_count': nc.get('upcoming_count', 0), 'next_event': nc.get('next_event'), 'pre_news_bias': nc.get('pre_news_bias', 'No imminent high-impact event.')}
             prompt_template = NEWS_ANALYSIS_PROMPT
         else:
@@ -3677,7 +3447,6 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         structural_score_context = f"Python structural score: {structural_context['structural_score']}/100 | Basis: {structural_context['score_reason']}"
         historical_context = build_historical_context(m10)
         firm_bias_text = f"{firm} (standing desk bias; weighted MTF evidence {picture.get('score', 0):+.1f})" if firm else "NONE - evidence tied; stand aside unless a clear edge emerges."
-        strategy_votes = build_strategy_votes(m10, swings, current_price, htf_bias=(htf_context or {}).get('bias') or (picture or {}).get('htf_bias') or 'NEUTRAL', dxy_context=dxy_context, order_blocks=order_blocks, fvgs=fvgs)
         candidate_levels = build_candidate_levels(symbol, current_price, swings, order_blocks, fvgs, setup_context.get('atr'), pair_config)
         all_format_kwargs = {
             'data_summary': prompt_data, 'microstructure_data': prompt_micro,
@@ -3689,8 +3458,6 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
             'news_summary': news_text, 'structural_score_context': structural_score_context,
             'directional_ledger': directional_ledger, 'firm_bias': firm_bias_text,
             'max_entry_distance': max_entry_distance,
-            'strategy_votes': json.dumps({k: {'direction': v['direction'], 'reason': v['reason']} for k, v in strategy_votes.items()}, indent=2, default=str),
-            'data_confidence': live_snapshot.get('confidence', 0.0),
             'candidate_levels': json.dumps(candidate_levels, indent=2, default=str),
         }
 
@@ -3772,19 +3539,16 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         analysis = cross_check_ai_evidence(analysis)
         # ...then the standing desk bias has the FINAL word.
         firm_norm = normalize_ai_signal(firm) if firm else None
-    if firm_norm and analysis.get('signal') in ('BUY', 'SELL') and analysis['signal'] != firm_norm:
-        firm_conf = strategy_confluence(strategy_votes, firm_norm)
-        if firm_conf['agree'] >= MIN_STRATEGY_AGREEMENT and firm_conf['net'] > 0:
-            analysis['signal'] = firm_norm
-            analysis['reasoning'] = (analysis.get('reasoning') or '') + f" The standing {firm_norm} desk bias is maintained and is backed by strategy confluence ({firm_conf['agree']} agreeing votes)."
-        else:
-            analysis['confidence'] = 'LOW'
-            analysis['confluence_score'] = min(analysis.get('confluence_score', 0), MINIMUM_CONFLUENCE_SCORE + 2)
-            analysis['reasoning'] = (analysis.get('reasoning') or '') + f" Desk bias {firm_norm} differs from the AI view but strategy confluence does not support a flip; treated as low conviction, no forced reversal."
-analysis = apply_conservative_signal_filter(analysis, structural_context, candles, dxy_context, news_context, current_price, swings, symbol, pair_config=pair_config)
-analysis = apply_signal_quality_gate(analysis, strategy_votes, phase_context, micro, (htf_context or {}).get('bias') or (picture or {}).get('htf_bias') or 'NEUTRAL', symbol=symbol, data_confidence=live_snapshot.get('confidence', 0.0))
-    analysis = maybe_convert_to_limit_order(analysis, strategy_votes, swings, order_blocks, fvgs, current_price, setup_context.get('atr'), pair_config)
-            analysis = finalize_trade_plan(
+        if firm_norm and analysis.get('signal') in ('BUY', 'SELL') and analysis['signal'] != firm_norm:
+            ev = analysis.get('directional_evidence') or {}
+            counter = len(ev.get('bullish', [])) if firm_norm == 'BUY' else len(ev.get('bearish', []))
+            if counter >= 3:
+                analysis['reasoning'] = (analysis.get('reasoning') or '') + f" (AI overrode the standing {firm_norm} desk bias with {counter} counter-evidences.)"
+            else:
+                analysis['signal'] = firm_norm
+                analysis['reasoning'] = (analysis.get('reasoning') or '') + f" The standing {firm_norm} desk bias is maintained; the AI view was aligned to the desk bias."
+        analysis = apply_conservative_signal_filter(analysis, structural_context, candles, dxy_context, news_context, current_price, swings, symbol, pair_config=pair_config)
+        analysis = finalize_trade_plan(
             analysis=analysis,
             symbol=symbol,
             current_price=current_price,
