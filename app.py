@@ -1971,6 +1971,7 @@ def sync_news_event_statuses(news_events, selected_symbols=None):
     for stale_id in stale_ids:
         del statuses[stale_id]
         st.session_state.news_signal_sent.pop(stale_id, None)
+        st.session_state.news_event_results.pop(stale_id, None)
     st.session_state.news_event_statuses = statuses
 
 def update_news_event_status(event, status, detail=None):
@@ -4000,6 +4001,7 @@ with tab4:
     news = get_high_impact_news(selected_symbols=selected_symbols, reference_dt=datetime.now(timezone.utc))
     sync_news_event_statuses(news, selected_symbols=selected_symbols)
     if news:
+        st.caption("Only high-impact events and pre-news impact results appear here. Regular market analysis and notifications are shown in the Live Monitoring and Notifications tabs.")
         for n in news:
             event_id = n.get('event_id') or f"{n.get('event')}|{n.get('currency')}|{n.get('time')}"
             status_meta = st.session_state.news_event_statuses.get(event_id, {})
@@ -4020,11 +4022,12 @@ with tab4:
             stored = st.session_state.news_event_results.get(event_id)
             if stored:
                 for symbol, a in stored['results'].items():
+                    if not a.get('is_news_signal'):
+                        continue
                     sig = a.get('signal', 'SKIPPED')
                     if sig in ('BUY', 'SELL'):
                         sig_emoji = "🟢" if sig == 'BUY' else "🔴"
                         st.success(f"{sig_emoji} **{symbol}**: {sig}")
-                        # Show historical pattern if available
                         hist_pattern = a.get('historical_pattern', '')
                         if hist_pattern:
                             st.caption(f"📚 Historical: {hist_pattern[:300]}")
