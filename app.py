@@ -3868,61 +3868,62 @@ if st.session_state.get('analysis_in_progress'):
     if _run_started is None or (datetime.now() - _run_started).total_seconds() > 900:
         st.session_state.analysis_in_progress = False
         add_notification('warning', '🔄 Watchdog cleared a stale analysis-in-progress flag.')
-    if st.session_state.bot_running:
-        if st.session_state.analysis_in_progress:
-            st.info("🔄 Analysis is already in progress. Refreshing status and countdown...")
-        elif st.session_state.next_check_time:
-            time_left = (st.session_state.next_check_time - datetime.now()).total_seconds()
-            if time_left > 0:
-                st.warning(f"⏳ Waiting {int(time_left)}s until the next scheduled analysis. Keep this page open.")
-            elif is_scheduled_run_due():
-                scheduled_start = st.session_state.next_check_time or datetime.now()
-                if is_gpt_rate_limited():
-                    st.warning("⏳ Gemini rate limit in effect - using cached/fallback analysis this cycle to keep the strict 5-minute cadence.")
-                st.session_state.analysis_in_progress = True
-                st.session_state.analysis_started_at = datetime.now()
-                try:
-                    st.info("🔄 Running scheduled analysis...")
-                    progress_bar = st.progress(0)
-                    st.session_state.rate_limit_hit = False
-                    all_data = load_market_data(force_refresh=False)
-                    for i, symbol in enumerate(selected_symbols):
-                        next_pair = selected_symbols[i + 1] if i + 1 < len(selected_symbols) else None
-                        if st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited():
-                            st.warning("⏳ Rate limit reached. Using cached/fallback analysis for this symbol.")
-                            cached_result = get_cached_analysis(symbol)
-                            result = cached_result if cached_result is not None else _local_fallback(symbol, all_data)
-                            update_analysis_status(symbol=symbol, message=f"Rate-limited: cached/fallback analysis for {symbol}", next_pair=next_pair)
-                            render_analysis_status(status_placeholder)
-                            try:
-                                process_symbol_result(result, symbol, is_auto=True, all_data=all_data)
-                            except Exception as proc_exc:
-                                add_notification('warning', f"❌ {symbol}: result processing failed: {proc_exc}", symbol=symbol)
-                        else:
-                            update_analysis_status(symbol=symbol, message=f"Starting scheduled analysis for {symbol}", next_pair=next_pair)
-                            render_analysis_status(status_placeholder)
-                            result = analyze_symbol_premium(symbol, all_data, news_override=None)
-                            set_cached_analysis(symbol, result)
-                            try:
-                                process_symbol_result(result, symbol, is_auto=True, all_data=all_data)
-                            except Exception as proc_exc:
-                                add_notification('warning', f"❌ {symbol}: result processing failed: {proc_exc}", symbol=symbol)
-                        if i < len(selected_symbols) - 1 and not (st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited()):
-                            time.sleep(GEMINI_MIN_REQUEST_INTERVAL)
-                        progress_bar.progress((i + 1) / len(selected_symbols))
-                    progress_bar.empty()
-                    now_utc = datetime.now(timezone.utc)
-                    fresh_news = get_high_impact_news(selected_symbols=selected_symbols, reference_dt=now_utc)
-                    sync_news_event_statuses(fresh_news, selected_symbols=selected_symbols)
-                    target_event = pick_news_event_for_analysis(fresh_news, now_utc)
-                    if target_event and not (st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited()):
-                        st.info(f"📰 Running pre-news impact analysis for: {target_event.get('event')} ({target_event.get('time')})...")
-                        run_news_analysis_cycle(target_event, all_data, selected_symbols)
-                    st.session_state.last_analysis_time = datetime.now()
-                    st.session_state.next_check_time = scheduled_start + timedelta(minutes=ANALYSIS_INTERVAL_MINUTES)
-                    add_notification('info', f"✅ Scheduled analysis complete. Next run at {st.session_state.next_check_time.strftime('%H:%M:%S')}.")
-                finally:
-                    st.session_state.analysis_in_progress = False
+
+if st.session_state.bot_running:
+    if st.session_state.analysis_in_progress:
+        st.info("🔄 Analysis is already in progress. Refreshing status and countdown...")
+    elif st.session_state.next_check_time:
+        time_left = (st.session_state.next_check_time - datetime.now()).total_seconds()
+        if time_left > 0:
+            st.warning(f"⏳ Waiting {int(time_left)}s until the next scheduled analysis. Keep this page open.")
+        elif is_scheduled_run_due():
+            scheduled_start = st.session_state.next_check_time or datetime.now()
+            if is_gpt_rate_limited():
+                st.warning("⏳ Gemini rate limit in effect - using cached/fallback analysis this cycle to keep the strict 5-minute cadence.")
+            st.session_state.analysis_in_progress = True
+            st.session_state.analysis_started_at = datetime.now()
+            try:
+                st.info("🔄 Running scheduled analysis...")
+                progress_bar = st.progress(0)
+                st.session_state.rate_limit_hit = False
+                all_data = load_market_data(force_refresh=False)
+                for i, symbol in enumerate(selected_symbols):
+                    next_pair = selected_symbols[i + 1] if i + 1 < len(selected_symbols) else None
+                    if st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited():
+                        st.warning("⏳ Rate limit reached. Using cached/fallback analysis for this symbol.")
+                        cached_result = get_cached_analysis(symbol)
+                        result = cached_result if cached_result is not None else _local_fallback(symbol, all_data)
+                        update_analysis_status(symbol=symbol, message=f"Rate-limited: cached/fallback analysis for {symbol}", next_pair=next_pair)
+                        render_analysis_status(status_placeholder)
+                        try:
+                            process_symbol_result(result, symbol, is_auto=True, all_data=all_data)
+                        except Exception as proc_exc:
+                            add_notification('warning', f"❌ {symbol}: result processing failed: {proc_exc}", symbol=symbol)
+                    else:
+                        update_analysis_status(symbol=symbol, message=f"Starting scheduled analysis for {symbol}", next_pair=next_pair)
+                        render_analysis_status(status_placeholder)
+                        result = analyze_symbol_premium(symbol, all_data, news_override=None)
+                        set_cached_analysis(symbol, result)
+                        try:
+                            process_symbol_result(result, symbol, is_auto=True, all_data=all_data)
+                        except Exception as proc_exc:
+                            add_notification('warning', f"❌ {symbol}: result processing failed: {proc_exc}", symbol=symbol)
+                    if i < len(selected_symbols) - 1 and not (st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited()):
+                        time.sleep(GEMINI_MIN_REQUEST_INTERVAL)
+                    progress_bar.progress((i + 1) / len(selected_symbols))
+                progress_bar.empty()
+                now_utc = datetime.now(timezone.utc)
+                fresh_news = get_high_impact_news(selected_symbols=selected_symbols, reference_dt=now_utc)
+                sync_news_event_statuses(fresh_news, selected_symbols=selected_symbols)
+                target_event = pick_news_event_for_analysis(fresh_news, now_utc)
+                if target_event and not (st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited()):
+                    st.info(f"📰 Running pre-news impact analysis for: {target_event.get('event')} ({target_event.get('time')})...")
+                    run_news_analysis_cycle(target_event, all_data, selected_symbols)
+                st.session_state.last_analysis_time = datetime.now()
+                st.session_state.next_check_time = scheduled_start + timedelta(minutes=ANALYSIS_INTERVAL_MINUTES)
+                add_notification('info', f"✅ Scheduled analysis complete. Next run at {st.session_state.next_check_time.strftime('%H:%M:%S')}.")
+            finally:
+                st.session_state.analysis_in_progress = False
 with tab2:
     st.header("📜 Premium Signal History")
     if len(st.session_state.signal_history) == 0:
