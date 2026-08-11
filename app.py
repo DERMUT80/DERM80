@@ -442,6 +442,80 @@ def get_live_price_for_symbol(symbol):
             return float(data['rates']['USD'])
     return None
 
+def fetch_trusted_spot(symbol):
+    """Multi-source live spot consensus (median of independent feeds).
+    This is the clean, broker-grade reference price used for all levels."""
+    readings = []
+
+    def push(value):
+        try:
+            v = float(value)
+            if v > 0:
+                readings.append(v)
+        except Exception:
+            pass
+
+    if symbol == 'XAUUSD':
+        push((_request_json('https://api.gold-api.com/price/XAU', timeout=10) or {}).get('price'))
+        try:
+            gp = _request_json('https://data-asg.goldprice.org/dbXRates/USD', timeout=10)
+            if gp and isinstance(gp, dict):
+                items = gp.get('items') or []
+                if items:
+                    push(items[0].get('xauPrice'))
+        except Exception:
+            pass
+    elif symbol == 'BTCUSD':
+        push((_request_json('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT', timeout=10) or {}).get('price'))
+        try:
+            cb = _request_json('https://api.coinbase.com/v2/prices/BTC-USD/spot', timeout=10)
+            push(((cb or {}).get('data') or {}).get('amount'))
+        except Exception:
+            pass
+    elif symbol == 'EURUSD':
+        push(((_request_json('https://api.frankfurter.app/latest?from=EUR&to=USD', timeout=10) or {}).get('rates') or {}).get('USD'))
+        push((_request_json('https://api.binance.com/api/v3/ticker/price?symbol=EURUSDT', timeout=10) or {}).get('price'))
+
+    # Independent extra reading from Yahoo fast_info (mapped symbol).
+    if yf is not None:
+        try:
+            ticker = yf.Ticker(YFINANCE_MAP.get(symbol, symbol))
+            for attr in ['lastPrice', 'regularMarketPrice', 'currentPrice']:
+                value = getattr(getattr(ticker, 'fast_info', None), attr, None)
+                if value is not None:
+                    push(value)
+                    break
+        except Exception:
+            pass
+
+    if not readings:
+        return None
+    readings.sort()
+    return readings[len(readings) // 2]
+
+
+def align_df_to_spot(df, spot, max_dev_pct=0.004):
+    """Rebase OHLC candles onto the trusted live spot when the tape is displaced.
+    Structure (swings/OB/FVG) is preserved; price levels match the real market."""
+    if df is None or getattr(df, 'empty', True) or spot is None:
+        return df, 1.0
+    try:
+        last = float(df['Close'].iloc[-1])
+    except Exception:
+        return df, 1.0
+    if last <= 0:
+        return df, 1.0
+    dev = abs(spot - last) / last
+    if dev <= max_dev_pct:
+        return df, 1.0
+    factor = spot / last
+    out = df.copy()
+    for col in ['Open', 'High', 'Low', 'Close']:
+        if col in out.columns:
+            out[col] = out[col] * factor
+    return out, factor
+
+
 def get_latest_quote(symbol):
     price = get_live_price_for_symbol(symbol)
     if price is not None:
@@ -464,17 +538,19 @@ def get_latest_quote(symbol):
     return None
 
 def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
-    """Live quote is used ONLY if it agrees with the analyzed candles (<=0.5% deviation)."""
+    """The trusted spot consensus is authoritative. Candles are rebased to it
+    inside analyze_symbol_premium, so levels always match the real market."""
     fallback_price = None
     if fallback_df is not None and not fallback_df.empty:
         fallback_price = float(fallback_df['Close'].iloc[-1])
-    price = get_latest_quote(symbol)
-    if price is not None and fallback_price is not None and fallback_price > 0:
-        if abs(price - fallback_price) / fallback_price > 0.005:
-            price = None
+    price = fetch_trusted_spot(symbol)
+    if price is None:
+        price = get_latest_quote(symbol)
     if price is None:
         price = fallback_price
-    return {'symbol': symbol, 'price': price, 'source': 'live' if price is not None and fallback_price is not None and price != fallback_price else 'fallback'}
+    return {'symbol': symbol, 'price': price,
+            'source': 'live' if price is not None and fallback_price is not None and price != fallback_price else 'fallback'}
+
 
 def calculate_atr(df, period=14):
     if len(df) < period + 2:
@@ -3348,6 +3424,17 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
             return {"error": f"Failed to fetch market data for {symbol}. Yahoo Finance may be temporarily rate-limiting your IP. Please wait a few minutes and try again."}
         micro = calculate_microstructure(m10)
         current_price = live_snapshot.get('price') or float(m10['Close'].iloc[-1])
+        # DATA HYGIENE: rebase candles onto the trusted live spot so structure/levels match the real market.
+        if current_price:
+            for _tf in ('M10', 'M15', 'M30', 'H1', 'H4'):
+                _df = data.get(_tf)
+                if _df is not None and not getattr(_df, 'empty', True):
+                    _aligned, _fac = align_df_to_spot(_df, current_price)
+                    if _fac != 1.0:
+                        data[_tf] = _aligned
+            m10 = data.get('M10', m10)
+            h1 = data.get('H1', h1)
+            h4 = data.get('H4', h4)
         resolve_pending_outcomes({symbol: current_price})
         swings = find_swings(m10)
         pair_config = get_pair_config(symbol)
@@ -3712,7 +3799,7 @@ with tab1:
             elif combined_score >= min_score:
                 sig_color = "🟢" if result.get('signal') == "BUY" else "🔴"
                 if not is_auto: st.markdown(f"### {sig_color} **NEW SIGNAL:** {result.get('symbol', symbol)} - {result.get('signal')}")
-                else: st.success(f"{sig_color} **NEW SIGNAL:** {result.get('symbol', symbol)} - {result.get('signal')} | Score: {result.get('confluence_score')}/100")
+                else: st.toast(f"{sig_color} NEW SIGNAL: {result.get('symbol', symbol)} {result.get('signal')} | Score {result.get('confluence_score')}/100")
                 if not is_auto:
                     st.write(f"**DXY Correlation:** {result.get('dxy_correlation', 'N/A')}")
                     st.write(f"**Microstructure:** {result.get('microstructure_read', 'N/A')}")
@@ -3890,7 +3977,7 @@ if st.session_state.bot_running:
     elif st.session_state.next_check_time:
         time_left = (st.session_state.next_check_time - datetime.now()).total_seconds()
         if time_left > 0:
-            st.warning(f"⏳ Waiting {int(time_left)}s until the next scheduled analysis. Keep this page open.")
+            st.sidebar.info(f"⏳ Next scheduled analysis in {int(time_left)}s - keep this page open.")
         elif is_scheduled_run_due():
             scheduled_start = st.session_state.next_check_time or datetime.now()
             if is_gpt_rate_limited():
