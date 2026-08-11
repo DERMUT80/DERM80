@@ -3655,6 +3655,7 @@ with tab1:
         st.info(f"💾 Cached market data available ({age}s old). Repeat refreshes are near-instant.")
     render_countdown_timer()
     def process_symbol_result(result, symbol, is_auto=False, all_data=None):
+        # UPDATE-FINAL: detailed rendering is manual-only; auto runs use toast + notifications only.
         if not isinstance(result, dict):
             msg = f"❌ **{symbol}**: Analysis returned invalid result type ({type(result).__name__})."
             if not is_auto:
@@ -3668,8 +3669,8 @@ with tab1:
             st.session_state.rate_limit_hit = True
             next_retry = st.session_state.gpt_rate_limit_until or (datetime.now() + timedelta(seconds=GEMINI_MIN_REQUEST_INTERVAL))
             st.session_state.next_check_time = next_retry
-            reason = result.get('rate_limit_reason') or 'Groq is currently unavailable.'
-            msg = f"⏳ **{symbol}**: Groq rate limit active. {reason} Pausing analysis until {next_retry.strftime('%H:%M:%S')} to protect API quota."
+            reason = result.get('rate_limit_reason') or 'Gemini is currently unavailable.'
+            msg = f"⏳ **{symbol}**: Gemini rate limit active. {reason} Pausing analysis until {next_retry.strftime('%H:%M:%S')} to protect API quota."
             if not is_auto:
                 st.warning(msg)
             add_notification('warning', msg, symbol=symbol)
@@ -3687,7 +3688,8 @@ with tab1:
             msg = f"⚪ **{symbol}**: Signal Rejected. AI Logic Flaw: {logic_reason}"
             if detail:
                 msg += f" | Structural Detail: {detail}"
-            if not is_auto: st.info(msg)
+            if not is_auto:
+                st.info(msg)
             add_notification('warning', msg, symbol=symbol, signal=result.get('signal'))
             return
         if result.get('signal') == 'WAIT':
@@ -3707,7 +3709,8 @@ with tab1:
             msg = f"⚪ **{symbol}**: Signal Rejected. AI Reason: {math_reason}"
             if detail:
                 msg += f" | Structural Detail: {detail}"
-            if not is_auto: st.info(msg)
+            if not is_auto:
+                st.info(msg)
             add_notification('warning', msg, symbol=symbol, signal=result.get('signal'))
             return
         min_score = max(MINIMUM_CONFLUENCE_SCORE, pair_config.get('score_floor', MINIMUM_CONFLUENCE_SCORE))
@@ -3727,13 +3730,13 @@ with tab1:
             if is_repeat:
                 last_time = st.session_state.active_signals[symbol]['timestamp'].strftime('%H:%M')
                 msg = f"⏸️ **{symbol}**: Setup already active since {last_time}. Waiting for execution or structural invalidation. ({pair_config.get('cooldown_minutes', 30)}-min cooldown)"
-                if not is_auto: st.info(msg)
+                if not is_auto:
+                    st.info(msg)
                 add_notification('info', msg, symbol=symbol, signal=result.get('signal'))
             elif combined_score >= min_score:
                 sig_color = "🟢" if result.get('signal') == "BUY" else "🔴"
-                if not is_auto: st.markdown(f"### {sig_color} **NEW SIGNAL:** {result.get('symbol', symbol)} - {result.get('signal')}")
-                else: st.toast(f"{sig_color} NEW SIGNAL: {result.get('symbol', symbol)} {result.get('signal')} | Score {result.get('confluence_score')}/100")
                 if not is_auto:
+                    st.markdown(f"### {sig_color} **NEW SIGNAL:** {result.get('symbol', symbol)} - {result.get('signal')}")
                     st.write(f"**DXY Correlation:** {result.get('dxy_correlation', 'N/A')}")
                     st.write(f"**Microstructure:** {result.get('microstructure_read', 'N/A')}")
                     st.write(f"**Pre-News Bias:** {result.get('pre_news_bias', 'N/A')}")
@@ -3743,21 +3746,23 @@ with tab1:
                     col_b.metric("Confidence", result.get('confidence', 'N/A'))
                     col_c.metric("Score", f"{result.get('confluence_score', 0)}/100")
                     col_d.metric("R:R", f"1:{result.get('rr_ratio', 0)}")
-                # For news signals: show direction-only (no Entry/SL/TP)
-                if result.get('is_news_signal'):
-                    st.info(f"**Direction:** {result.get('signal')}")
-                    st.info(f"**Reasoning:** {result.get('reasoning')}")
-                    if result.get('historical_pattern'):
-                        st.info(f"**Historical Pattern:** {result.get('historical_pattern')}")
+                    if result.get('is_news_signal'):
+                        st.info(f"**Direction:** {result.get('signal')}")
+                        st.info(f"**Reasoning:** {result.get('reasoning')}")
+                        if result.get('historical_pattern'):
+                            st.info(f"**Historical Pattern:** {result.get('historical_pattern')}")
+                    else:
+                        st.info(f"**Entry:** {result.get('entry')} | **SL:** {result.get('stop_loss')} | **TP:** {result.get('take_profit')}")
+                    if result.get('order_type'):
+                        st.write(f"**Order Type:** {result.get('order_type')}")
+                    if result.get('order_description'):
+                        st.write(f"**Execution Plan:** {result.get('order_description')}")
+                    if result.get('confluence_breakdown'):
+                        st.write(f"**Confluence Breakdown:** {result.get('confluence_breakdown')}")
+                    st.write(f"**Reasoning:** {result.get('reasoning')}")
+                    st.markdown("---")
                 else:
-                    st.info(f"**Entry:** {result.get('entry')} | **SL:** {result.get('stop_loss')} | **TP:** {result.get('take_profit')}")
-                if result.get('order_type'):
-                    st.write(f"**Order Type:** {result.get('order_type')}")
-                if result.get('order_description'):
-                    st.write(f"**Execution Plan:** {result.get('order_description')}")
-                if result.get('confluence_breakdown'):
-                    st.write(f"**Confluence Breakdown:** {result.get('confluence_breakdown')}")
-                st.write(f"**Reasoning:** {result.get('reasoning')}")
+                    st.toast(f"{sig_color} NEW SIGNAL: {result.get('symbol', symbol)} {result.get('signal')} | Score {result.get('confluence_score')}/100")
                 st.session_state.active_signals[symbol] = {'direction': result.get('signal'), 'entry': result.get('entry', 0), 'timestamp': current_time, 'score': combined_score}
                 result['analyzed_at'] = current_time
                 st.session_state.signal_history.append(result)
@@ -3767,15 +3772,16 @@ with tab1:
                     st.success("✅ Signal sent to Telegram (Local Bridge will execute)")
                 reason_snippet = (result.get('reasoning') or result.get('pre_news_bias') or 'No clear directional bias.').strip()
                 add_notification('success', f"✅ **{symbol}**: New {result.get('signal')} signal accepted. Score: {combined_score}/100. Entry: {result.get('entry')} | SL: {result.get('stop_loss')} | TP: {result.get('take_profit', ['N/A'])[0] if result.get('take_profit') else 'N/A'}. Reason: {reason_snippet}", symbol=symbol, signal=result.get('signal'), score=combined_score)
-                if not is_auto: st.markdown("---")
             else:
                 st.session_state.active_signals[symbol] = {'direction': result.get('signal'), 'entry': result.get('entry', 0), 'timestamp': current_time, 'score': combined_score}
                 add_notification('info', f"🧭 **{symbol}**: Candidate setup detected with score {combined_score}/100; awaiting confirmation.", symbol=symbol, signal=result.get('signal'), score=combined_score)
         else:
             ai_reason = result.get('display_reasoning') or result.get('reasoning') or result.get('rejection_reason', 'Low confidence or DXY contradiction')
             msg = f"⚪ **{symbol}**: Signal Rejected. Score: {result.get('confluence_score', 0)}/100, Confidence: {result.get('confidence', 'N/A')}. AI Reason: {ai_reason}"
-            if not is_auto: st.info(msg)
+            if not is_auto:
+                st.info(msg)
             add_notification('warning', msg, symbol=symbol, signal=result.get('signal'), score=result.get('confluence_score'))
+
     news_events = get_high_impact_news(selected_symbols=selected_symbols, reference_dt=datetime.now(timezone.utc))
     sync_news_event_statuses(news_events, selected_symbols=selected_symbols)
     refresh_col, spacer = st.columns([2, 8])
@@ -3953,7 +3959,9 @@ if st.session_state.bot_running:
                 sync_news_event_statuses(fresh_news, selected_symbols=selected_symbols)
                 target_event = pick_news_event_for_analysis(fresh_news, now_utc)
                 if target_event and not (st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited()):
-                    st.info(f"📰 Running pre-news impact analysis for: {target_event.get('event')} ({target_event.get('time')})...")
+                    add_notification('info', f"📰 Running pre-news impact analysis for: {target_event.get('event')} ({target_event.get('time')})...")
+                    update_analysis_status(symbol='NEWS', message=f"Pre-news analysis: {target_event.get('event')}")
+                    render_analysis_status(status_placeholder)
                     run_news_analysis_cycle(target_event, all_data, selected_symbols)
                 st.session_state.last_analysis_time = datetime.now()
                 st.session_state.next_check_time = scheduled_start + timedelta(minutes=ANALYSIS_INTERVAL_MINUTES)
