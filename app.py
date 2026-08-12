@@ -2023,28 +2023,14 @@ def fetch_all_data():
     return data
 
 # FIX: Allow MEDIUM impact events if USD-sensitive (e.g., Jobless Claims)
-_NEWS_CACHE = {"ts": None, "data": None, "fail_ts": None}
-
 def get_high_impact_news(selected_symbols=None, reference_dt=None):
-    now = datetime.now(timezone.utc)
-    cache = _NEWS_CACHE
-    if cache["ts"] is not None and cache["data"] is not None and (now - cache["ts"]).total_seconds() < 300:
-        return cache["data"]
-    if cache["fail_ts"] is not None and (now - cache["fail_ts"]).total_seconds() < 60:
-        return cache["data"] or []
     endpoints = [
         "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-        "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json?apifooter=false",
     ]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept": "application/json,text/plain,*/*",
-    }
-    reference_dt = reference_dt or now
-    final = []
     for url in endpoints:
         try:
-            res = requests.get(url, params={"apifooter": "false"}, headers=headers, timeout=20)
+            res = requests.get(url, params={"apifooter": "false"}, timeout=20)
             res.raise_for_status()
             text = res.text
             if text.startswith("Title:") or "Markdown Content:" in text:
@@ -2054,19 +2040,15 @@ def get_high_impact_news(selected_symbols=None, reference_dt=None):
                 payload = payload.get('events') or payload.get('items') or payload.get('data') or []
             if not isinstance(payload, list):
                 continue
+            reference_dt = reference_dt or datetime.now(timezone.utc)
+            # FIX: only_high=False to include MEDIUM USD-sensitive events
             events = parse_news_payload(payload, reference_dt=reference_dt, lookahead_hours=168, only_high=False)
             if events:
                 filtered_events = filter_relevant_news([{'event': e['event'], 'currency': e['currency'], 'impact': e['impact'], 'time': e['time'], 'event_time_utc': e['event_time_utc'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone']} for e in events], selected_symbols=selected_symbols, reference_dt=reference_dt)
-                final = [{'time': format_east_africa_time(e['event_time_utc']), 'currency': e['currency'], 'event': e['event'], 'impact': e['impact'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone'], 'event_time_utc': e['event_time_utc'], 'event_id': f"{e['event']}|{e['currency']}|{e['event_time_utc'].strftime('%Y-%m-%d %H:%M:%S')}"} for e in filtered_events]
-                if final:
-                    break
+                return [{'time': format_east_africa_time(e['event_time_utc']), 'currency': e['currency'], 'event': e['event'], 'impact': e['impact'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone'], 'event_time_utc': e['event_time_utc'], 'event_id': f"{e['event']}|{e['currency']}|{e['event_time_utc'].strftime('%Y-%m-%d %H:%M:%S')}"} for e in filtered_events]
         except Exception as exc:
             print(f"⚠️ News fetch failed for {url}: {exc}")
-    if final:
-        cache["ts"], cache["data"], cache["fail_ts"] = now, final, None
-    else:
-        cache["fail_ts"], cache["data"] = now, []
-    return final
+    return []
 
 def sync_news_event_statuses(news_events, selected_symbols=None):
     statuses = st.session_state.news_event_statuses
@@ -4130,7 +4112,7 @@ def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
     return snap
 
 _orig_call_gpt = call_gpt
-def call_gpt(system_prompt, user_content, max_tokens=2000, retry_count=0, estimated_tokens=None):
+def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estimated_tokens=None):
     try:
         sym = st.session_state.get("_snapshot_symbol")
         img = st.session_state.get("_snapshot_" + sym) if sym else None
