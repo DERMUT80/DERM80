@@ -2023,28 +2023,14 @@ def fetch_all_data():
     return data
 
 # FIX: Allow MEDIUM impact events if USD-sensitive (e.g., Jobless Claims)
-_NEWS_CACHE = {"ts": None, "data": None, "fail_ts": None}
-
 def get_high_impact_news(selected_symbols=None, reference_dt=None):
-    now = datetime.now(timezone.utc)
-    cache = _NEWS_CACHE
-    if cache["ts"] is not None and cache["data"] is not None and (now - cache["ts"]).total_seconds() < 300:
-        return cache["data"]
-    if cache["fail_ts"] is not None and (now - cache["fail_ts"]).total_seconds() < 60:
-        return cache["data"] or []
     endpoints = [
         "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
-        "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+        "https://nfs.faireconomy.media/ff_calendar_thisweek.json?apifooter=false",
     ]
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "Accept": "application/json,text/plain,*/*",
-    }
-    reference_dt = reference_dt or now
-    final = []
     for url in endpoints:
         try:
-            res = requests.get(url, params={"apifooter": "false"}, headers=headers, timeout=20)
+            res = requests.get(url, params={"apifooter": "false"}, timeout=20)
             res.raise_for_status()
             text = res.text
             if text.startswith("Title:") or "Markdown Content:" in text:
@@ -2054,19 +2040,15 @@ def get_high_impact_news(selected_symbols=None, reference_dt=None):
                 payload = payload.get('events') or payload.get('items') or payload.get('data') or []
             if not isinstance(payload, list):
                 continue
+            reference_dt = reference_dt or datetime.now(timezone.utc)
+            # FIX: only_high=False to include MEDIUM USD-sensitive events
             events = parse_news_payload(payload, reference_dt=reference_dt, lookahead_hours=168, only_high=False)
             if events:
                 filtered_events = filter_relevant_news([{'event': e['event'], 'currency': e['currency'], 'impact': e['impact'], 'time': e['time'], 'event_time_utc': e['event_time_utc'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone']} for e in events], selected_symbols=selected_symbols, reference_dt=reference_dt)
-                final = [{'time': format_east_africa_time(e['event_time_utc']), 'currency': e['currency'], 'event': e['event'], 'impact': e['impact'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone'], 'event_time_utc': e['event_time_utc'], 'event_id': f"{e['event']}|{e['currency']}|{e['event_time_utc'].strftime('%Y-%m-%d %H:%M:%S')}"} for e in filtered_events]
-                if final:
-                    break
+                return [{'time': format_east_africa_time(e['event_time_utc']), 'currency': e['currency'], 'event': e['event'], 'impact': e['impact'], 'minutes_until': e['minutes_until'], 'within_2h': e['within_2h'], 'timezone': e['timezone'], 'event_time_utc': e['event_time_utc'], 'event_id': f"{e['event']}|{e['currency']}|{e['event_time_utc'].strftime('%Y-%m-%d %H:%M:%S')}"} for e in filtered_events]
         except Exception as exc:
             print(f"⚠️ News fetch failed for {url}: {exc}")
-    if final:
-        cache["ts"], cache["data"], cache["fail_ts"] = now, final, None
-    else:
-        cache["fail_ts"], cache["data"] = now, []
-    return final
+    return []
 
 def sync_news_event_statuses(news_events, selected_symbols=None):
     statuses = st.session_state.news_event_statuses
@@ -2291,7 +2273,7 @@ def run_news_analysis_cycle(event, all_data, symbols):
 # ── Gemini / Rate Limits ────────────────────────────────────────────────────────
 GEMINI_MIN_REQUEST_INTERVAL = 3
 GEMINI_TOKEN_LIMIT_PER_MINUTE = 500000
-GEMINI_ESTIMATED_RESPONSE_TOKENS = 5000
+GEMINI_ESTIMATED_RESPONSE_TOKENS = 600
 GEMINI_MODELS = ['gemini-flash-latest', 'gemini-flash-lite-latest']
 
 def estimate_tokens_for_text(text):
@@ -2389,7 +2371,7 @@ def load_market_data(force_refresh=False):
 MARKET_ANALYSIS_PROMPT = build_market_analysis_prompt()
 NEWS_ANALYSIS_PROMPT = build_news_analysis_prompt()
 
-def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estimated_tokens=None):
+def call_gpt(system_prompt, user_content, max_tokens=2000, retry_count=0, estimated_tokens=None):
     api_key = get_secret("GEMINI_API_KEY", "")
     if not api_key or not (api_key.startswith("AIza") or api_key.startswith("AQ.")):
         return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "Missing Gemini API Key.", "estimated_tokens": estimated_tokens}
@@ -3488,7 +3470,7 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         # Use the full instruction template as the system prompt so the model treats
         # the news/market analysis rules as authoritative system-level behavior.
         estimated_tokens = estimate_analysis_tokens(prompt_template, user_content)
-        analysis = call_gpt(prompt_template, user_content, max_tokens=4000, estimated_tokens=estimated_tokens)
+        analysis = call_gpt(prompt_template, user_content, max_tokens=2000, estimated_tokens=estimated_tokens)
         # Refresh executable quote after AI latency before final level enforcement.
         _post_ai_snapshot = get_live_market_snapshot(symbol, YFINANCE_MAP.get(symbol, symbol), fallback_df=m10)
         if _post_ai_snapshot.get("price"):
