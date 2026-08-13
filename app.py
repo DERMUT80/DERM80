@@ -4233,7 +4233,9 @@ with tab1:
             return
         result['symbol'] = result.get('symbol') or symbol
         summary_reason = (result.get('display_reasoning') or result.get('reasoning') or result.get('rejection_reason') or result.get('error') or 'No additional details provided.')
-        add_notification('info', f"🧠 **{symbol}**: AI analysis complete. Signal: {result.get('signal', 'N/A')} | Confidence: {result.get('confidence', 'N/A')} | Score: {result.get('confluence_score', 'N/A')}/100. Reason: {summary_reason}", symbol=symbol, signal=result.get('signal'), score=result.get('confluence_score'))
+        model_used = result.get('model_used', 'PYTHON_FALLBACK')
+        add_notification('info', f"🧠 **{symbol}**: AI analysis complete [{model_used}]. Signal: {result.get('signal', 'N/A')} | Confidence: {result.get('confidence', 'N/A')} | Score: {result.get('confluence_score', 'N/A')}/100. Reason: {summary_reason}", symbol=symbol, signal=result.get('signal'), score=result.get('confluence_score'))
+        
         if result.get('rejection_reason') == 'RATE_LIMIT':
             st.session_state.rate_limit_hit = True
             next_retry = st.session_state.gpt_rate_limit_until or (datetime.now() + timedelta(seconds=GROQ_MIN_REQUEST_INTERVAL))
