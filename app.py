@@ -2470,7 +2470,12 @@ def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estima
                 return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "RATE_LIMIT", "rate_limit_reason": st.session_state.gpt_rate_limit_reason, "estimated_tokens": estimated_tokens}
             if res.status_code in (400, 404) and 'model' in res.text.lower():
                 continue
+            if res.status_code != 200:
+                print(f"🔴 GROQ HTTP ERROR [{model}] Status {res.status_code}: {res.text[:800]}")
             res_data = res.json()
+            if not isinstance(res_data, dict) or 'choices' not in res_data:
+                print(f"🔴 GROQ NO-CHOICES ERROR [{model}] Status {res.status_code}: {res.text[:800]}")
+                return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": f"Groq error: {res.text[:300]}", "estimated_tokens": estimated_tokens}
             content = res_data['choices'][0]['message'].get('content', '')
             # strip code fences
             content = re.sub(r'^```(?:json)?\s*', '', content, flags=re.IGNORECASE)
