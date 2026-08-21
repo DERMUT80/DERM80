@@ -2294,8 +2294,8 @@ def run_news_analysis_cycle(event, all_data, symbols):
 GROQ_MIN_REQUEST_INTERVAL = 20
 GROQ_TOKEN_LIMIT_PER_MINUTE = 60000
 GROQ_TOKEN_LIMIT_PER_DAY = 500000
-GROQ_ESTIMATED_RESPONSE_TOKENS = 2000
-GROQ_IMAGE_TOKEN_ESTIMATE = 1600
+GROQ_ESTIMATED_RESPONSE_TOKENS = 5000
+GROQ_IMAGE_TOKEN_ESTIMATE = 2000
 GROQ_MODELS = ['qwen/qwen3.6-27b']
 
 def estimate_tokens_for_text(text):
@@ -2433,7 +2433,7 @@ def load_market_data(force_refresh=False):
 MARKET_ANALYSIS_PROMPT = build_market_analysis_prompt()
 NEWS_ANALYSIS_PROMPT = build_news_analysis_prompt()
 
-def call_gpt(system_prompt, user_content, max_tokens=2048, retry_count=0, estimated_tokens=None):
+def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estimated_tokens=None):
     api_key = get_secret("GROQ_API_KEY", "")
     if not api_key or not (str(api_key).strip().startswith(("gsk_", "groq_"))):
         return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "Missing Groq API Key.", "estimated_tokens": estimated_tokens}
@@ -3538,7 +3538,7 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         # Use the full instruction template as the system prompt so the model treats
         # the news/market analysis rules as authoritative system-level behavior.
         estimated_tokens = estimate_analysis_tokens(prompt_template, user_content)
-        analysis = call_gpt(prompt_template, user_content, max_tokens=2048, estimated_tokens=estimated_tokens)
+        analysis = call_gpt(prompt_template, user_content, max_tokens=4000, estimated_tokens=estimated_tokens)
         # Refresh executable quote after AI latency before final level enforcement.
         _post_ai_snapshot = get_live_market_snapshot(symbol, YFINANCE_MAP.get(symbol, symbol), fallback_df=m10)
         if _post_ai_snapshot.get("price"):
@@ -4180,7 +4180,7 @@ def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
     return snap
 
 _orig_call_gpt = call_gpt
-def call_gpt(system_prompt, user_content, max_tokens=2048, retry_count=0, estimated_tokens=None):
+def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estimated_tokens=None):
     try:
         sym = st.session_state.get("_snapshot_symbol")
         img = st.session_state.get("_snapshot_" + sym) if sym else None
