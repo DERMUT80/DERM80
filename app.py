@@ -2454,29 +2454,15 @@ def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estima
                 st.session_state.gpt_rate_limit_until = datetime.now() + timedelta(seconds=wait_time)
                 st.session_state.gpt_rate_limit_reason = f"Minimum request spacing not met. Wait {wait_time}s before the next Groq call."
                 return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "RATE_LIMIT", "rate_limit_reason": st.session_state.gpt_rate_limit_reason, "estimated_tokens": estimated_tokens}
-                # GROQ 8K TPM HARD LIMIT GUARD (AGGRESSIVE - fits within 8000 TPM)
-if isinstance(user_content, list):
-    for item in user_content:
-        if isinstance(item, dict) and item.get("type") == "text":
-            text = item.get("text", "")
-            import re as _re
-            # Always remove candidate plans (saves ~800 tokens)
-            if "PYTHON CANDIDATE EXECUTION PLANS:" in text:
-                text = _re.sub(r'PYTHON CANDIDATE EXECUTION PLANS:.*?(?=ENTRY EXECUTION RULES:)', 'PYTHON CANDIDATE EXECUTION PLANS: [Use structural levels from context]\n', text, flags=_re.DOTALL)
-            # If still too long, remove multitimeframe context (saves ~600 tokens)
-            if len(text) > 14000:
-                text = _re.sub(r'MULTI-TIMEFRAME CONTEXT \(10M/15M/30M/1H/4H\):.*?(?=RSI VALUES)', 'MULTI-TIMEFRAME CONTEXT: [Condensed - see structure data]
-', text, flags=_re.DOTALL)
-            # If still too long, remove RSI divergence details (saves ~400 tokens)
-            if len(text) > 12000:
-                text = _re.sub(r'RSI / DIVERGENCE CONTEXT:.*?(?=PREMIUM/DISCOUNT)', 'RSI / DIVERGENCE CONTEXT: [See RSI values above]
-', text, flags=_re.DOTALL)
-            # If still too long, remove market structure zones (saves ~300 tokens)
-            if len(text) > 10000:
-                text = _re.sub(r'MARKET STRUCTURE ZONES:.*?(?=MULTI-TIMEFRAME)', 'MARKET STRUCTURE ZONES: [See structure context]
-', text, flags=_re.DOTALL)
-            item["text"] = text
-
+            # GROQ 8K TPM HARD LIMIT GUARD
+            if isinstance(user_content, list):
+                for item in user_content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text = item.get("text", "")
+                        if len(text) > 20000 and "PYTHON CANDIDATE EXECUTION PLANS" in text:
+                            import re as _re
+                            text = _re.sub(r'PYTHON CANDIDATE EXECUTION PLANS:.*?(?=ENTRY EXECUTION RULES:)', 'PYTHON CANDIDATE EXECUTION PLANS: [Removed to fit Groq 8k TPM limit]\n', text, flags=_re.DOTALL)
+                            item["text"] = text
             payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}], "max_tokens": max_tokens, "temperature": 0.1}
             res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=90)
             st.session_state.last_gpt_request_time = datetime.now()
