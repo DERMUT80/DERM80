@@ -2454,7 +2454,7 @@ def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estima
                 st.session_state.gpt_rate_limit_until = datetime.now() + timedelta(seconds=wait_time)
                 st.session_state.gpt_rate_limit_reason = f"Minimum request spacing not met. Wait {wait_time}s before the next Groq call."
                 return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "RATE_LIMIT", "rate_limit_reason": st.session_state.gpt_rate_limit_reason, "estimated_tokens": estimated_tokens}
-            payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}], "max_tokens": max_tokens, "temperature": 0.1}, {"role": "user", "content": truncated_user_content}], "max_tokens": max_tokens, "temperature": 0.1}
+            payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}], "max_tokens": max_tokens, "temperature": 0.1}
             res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=90)
             st.session_state.last_gpt_request_time = datetime.now()
             try:
