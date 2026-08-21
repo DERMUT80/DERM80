@@ -1479,6 +1479,8 @@ OUTPUT JSON ONLY (NO MARKDOWN):
 
 MINIMUM_CONFLUENCE_SCORE = 70
 ANALYSIS_INTERVAL_MINUTES = 5
+GROQ_AI_INTERVAL_MINUTES = 15
+PYTHON_FALLBACK_INTERVAL_MINUTES = 5
 NEWS_PRE_WINDOW_HOURS = 2
 
 # ── Page Config ──────────────────────────────────────────────────────────────
@@ -2289,37 +2291,70 @@ def run_news_analysis_cycle(event, all_data, symbols):
     return True
 
 # ── Groq / Rate Limits ────────────────────────────────────────────────────────
-GROQ_MIN_REQUEST_INTERVAL = 3
-GROQ_TOKEN_LIMIT_PER_MINUTE = 500000
-GROQ_ESTIMATED_RESPONSE_TOKENS = 5000
-GROQ_MODELS = ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant']
+GROQ_MIN_REQUEST_INTERVAL = 20
+GROQ_TOKEN_LIMIT_PER_MINUTE = 60000
+GROQ_TOKEN_LIMIT_PER_DAY = 500000
+GROQ_ESTIMATED_RESPONSE_TOKENS = 2000
+GROQ_IMAGE_TOKEN_ESTIMATE = 1600
+GROQ_MODELS = ['qwen/qwen3.6-27b']
 
 def estimate_tokens_for_text(text):
     return max(1, int(len(text) / 4))
 
 def estimate_analysis_tokens(system_prompt, user_content):
-    prompt_text = system_prompt + ' ' + ' '.join([item.get('text', '') for item in user_content])
-    return estimate_tokens_for_text(prompt_text) + GROQ_ESTIMATED_RESPONSE_TOKENS
+    prompt_text = system_prompt + " " + " ".join([item.get("text", "") for item in user_content if isinstance(item, dict)])
+    image_count = sum(1 for item in user_content if isinstance(item, dict) and item.get("type") == "image_url")
+    return estimate_tokens_for_text(prompt_text) + GROQ_ESTIMATED_RESPONSE_TOKENS + (image_count * GROQ_IMAGE_TOKEN_ESTIMATE)
+
+
 
 def format_duration(seconds):
     return f"{int(seconds) // 60}m {int(seconds) % 60}s"
 
 def reserve_gpt_tokens(estimated_tokens):
     now = datetime.now()
+
+    # Daily rollover
+    if st.session_state.get("groq_token_day") != now.date():
+        st.session_state.groq_token_day = now.date()
+        st.session_state.groq_tokens_used_day = 0
+
+    # Minute rollover
     window_start = st.session_state.gpt_token_window_start
     if (now - window_start).total_seconds() >= 60:
         st.session_state.gpt_token_window_start = now
         st.session_state.gpt_tokens_used = 0
+
     if estimated_tokens is None:
         estimated_tokens = 0
+
+    # Daily guard
+    daily_used = st.session_state.get("groq_tokens_used_day", 0)
+    if daily_used + estimated_tokens > GROQ_TOKEN_LIMIT_PER_DAY:
+        next_reset = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+        st.session_state.gpt_rate_limit_until = next_reset
+        st.session_state.gpt_rate_limit_reason = (
+            f"Daily Groq token budget exceeded: {daily_used}/{GROQ_TOKEN_LIMIT_PER_DAY} used. "
+            f"Needs {estimated_tokens} more tokens. Budget resets at midnight local time."
+        )
+        return False
+
+    # Minute guard
     if st.session_state.gpt_tokens_used + estimated_tokens > GROQ_TOKEN_LIMIT_PER_MINUTE:
         next_reset = st.session_state.gpt_token_window_start + timedelta(minutes=1)
         st.session_state.gpt_rate_limit_until = next_reset
-        st.session_state.gpt_rate_limit_reason = f"Token budget exceeded: {st.session_state.gpt_tokens_used}/{GROQ_TOKEN_LIMIT_PER_MINUTE} used. Needs {estimated_tokens} more tokens and resets at {next_reset.strftime('%H:%M:%S')}."
+        st.session_state.gpt_rate_limit_reason = (
+            f"Groq minute token budget exceeded: {st.session_state.gpt_tokens_used}/{GROQ_TOKEN_LIMIT_PER_MINUTE} used. "
+            f"Needs {estimated_tokens} more tokens and resets at {next_reset.strftime('%H:%M:%S')}."
+        )
         return False
-    st.session_state.gpt_rate_limit_reason = ''
+
+    st.session_state.gpt_rate_limit_reason = ""
     st.session_state.gpt_tokens_used += estimated_tokens
+    st.session_state.groq_tokens_used_day = daily_used + estimated_tokens
     return True
+
+
 
 def update_analysis_status(symbol=None, message=None, estimated_tokens=None, estimated_duration=None, next_pair=None):
     st.session_state.analysis_status = {'current_pair': symbol, 'message': message, 'estimated_tokens': estimated_tokens, 'estimated_duration': estimated_duration, 'next_pair': next_pair}
@@ -2340,6 +2375,15 @@ def render_analysis_status(container):
     if st.session_state.gpt_rate_limit_until:
         lines.append(f"**Groq cooldown until:** {st.session_state.gpt_rate_limit_until.strftime('%H:%M:%S')}")
     container.markdown("\n".join(lines))
+
+def is_ai_analysis_due():
+    last_ai = st.session_state.get("last_ai_analysis_time")
+    if last_ai is None:
+        return True
+    return (datetime.now() - last_ai).total_seconds() >= GROQ_AI_INTERVAL_MINUTES * 60
+
+
+if 'last_ai_analysis_time' not in st.session_state: st.session_state.last_ai_analysis_time = None
 
 def is_scheduled_run_due():
     return (st.session_state.bot_running and st.session_state.next_check_time is not None and datetime.now() >= st.session_state.next_check_time and not st.session_state.analysis_in_progress)
@@ -2389,7 +2433,7 @@ def load_market_data(force_refresh=False):
 MARKET_ANALYSIS_PROMPT = build_market_analysis_prompt()
 NEWS_ANALYSIS_PROMPT = build_news_analysis_prompt()
 
-def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estimated_tokens=None):
+def call_gpt(system_prompt, user_content, max_tokens=2048, retry_count=0, estimated_tokens=None):
     api_key = get_secret("GROQ_API_KEY", "")
     if not api_key or not (str(api_key).strip().startswith(("gsk_", "groq_"))):
         return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "Missing Groq API Key.", "estimated_tokens": estimated_tokens}
@@ -2410,9 +2454,15 @@ def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estima
                 st.session_state.gpt_rate_limit_until = datetime.now() + timedelta(seconds=wait_time)
                 st.session_state.gpt_rate_limit_reason = f"Minimum request spacing not met. Wait {wait_time}s before the next Groq call."
                 return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "RATE_LIMIT", "rate_limit_reason": st.session_state.gpt_rate_limit_reason, "estimated_tokens": estimated_tokens}
-            payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": ("".join((str(part.get("text", "")) if isinstance(part, dict) and part.get("type") == "text" else (str(part) if isinstance(part, str) else "")) for part in user_content) if isinstance(user_content, list) else user_content)}], "max_tokens": max_tokens, "temperature": 0.1}
+            payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}], "max_tokens": max_tokens, "temperature": 0.1}
             res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=90)
             st.session_state.last_gpt_request_time = datetime.now()
+            try:
+                _rl_headers = {k: v for k, v in res.headers.items() if 'ratelimit' in k.lower() or 'retry-after' in k.lower()}
+                if _rl_headers:
+                    print(f"Groq rate headers [{model}]: {_rl_headers}")
+            except Exception:
+                pass
             if res.status_code == 429:
                 retry_after = int(res.headers.get('Retry-After', '60')) if res.headers.get('Retry-After') else 60
                 st.session_state.gpt_rate_limit_until = datetime.now() + timedelta(seconds=retry_after)
@@ -3488,7 +3538,7 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         # Use the full instruction template as the system prompt so the model treats
         # the news/market analysis rules as authoritative system-level behavior.
         estimated_tokens = estimate_analysis_tokens(prompt_template, user_content)
-        analysis = call_gpt(prompt_template, user_content, max_tokens=4000, estimated_tokens=estimated_tokens)
+        analysis = call_gpt(prompt_template, user_content, max_tokens=2048, estimated_tokens=estimated_tokens)
         # Refresh executable quote after AI latency before final level enforcement.
         _post_ai_snapshot = get_live_market_snapshot(symbol, YFINANCE_MAP.get(symbol, symbol), fallback_df=m10)
         if _post_ai_snapshot.get("price"):
@@ -3611,7 +3661,7 @@ import io as _io
 
 UPGRADE_MIN_SCORE = 72
 MINIMUM_CONFLUENCE_SCORE = UPGRADE_MIN_SCORE   # raise the global quality gate
-ENABLE_CHART_SNAPSHOT = False                    # set False if AI calls start failing
+ENABLE_CHART_SNAPSHOT = True                    # set False if AI calls start failing
 
 # ---------- 1) REGIME FILTER (ADX) ----------
 def _adx_value(df, period=14):
@@ -4130,11 +4180,11 @@ def get_live_market_snapshot(symbol, yf_symbol, fallback_df=None):
     return snap
 
 _orig_call_gpt = call_gpt
-def call_gpt(system_prompt, user_content, max_tokens=2000, retry_count=0, estimated_tokens=None):
+def call_gpt(system_prompt, user_content, max_tokens=2048, retry_count=0, estimated_tokens=None):
     try:
-        sym = None  # Groq migration: chart image injection disabled for text-only Groq models
+        sym = st.session_state.get("_snapshot_symbol")
         img = st.session_state.get("_snapshot_" + sym) if sym else None
-        if False and img and isinstance(user_content, list):  # Groq migration: image injection disabled
+        if img and isinstance(user_content, list):
             has_img = any(isinstance(p, dict) and p.get("type") == "image_url" for p in user_content)
             if not has_img:
                 user_content = user_content + [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}}]
@@ -4149,7 +4199,7 @@ st.title("🌍 Der-AI | Quantitative Macro System")
 st.markdown("**DXY Correlation | VWAP Microstructure | Pre-News Positioning | Telegram Bridge**")
 st.sidebar.header("⚙️ System Configuration")
 selected_symbols = st.sidebar.multiselect("Monitor Symbols", SYMBOLS, default=['XAUUSD', 'EURUSD', 'BTCUSD', 'US30'])
-st.sidebar.info(f"Analysis interval is fixed at {ANALYSIS_INTERVAL_MINUTES} minutes.")
+st.sidebar.info(f"Python desk checks every {PYTHON_FALLBACK_INTERVAL_MINUTES} min; full Groq AI analysis every {GROQ_AI_INTERVAL_MINUTES} min.")
 st.sidebar.markdown("---")
 st.sidebar.subheader("🎯 Signal Sensitivity")
 st.sidebar.caption(f"Signals are only accepted when the AI score reaches at least {MINIMUM_CONFLUENCE_SCORE}/100.")
@@ -4233,9 +4283,7 @@ with tab1:
             return
         result['symbol'] = result.get('symbol') or symbol
         summary_reason = (result.get('display_reasoning') or result.get('reasoning') or result.get('rejection_reason') or result.get('error') or 'No additional details provided.')
-        model_used = result.get('model_used', 'PYTHON_FALLBACK')
-        add_notification('info', f"🧠 **{symbol}**: AI analysis complete [{model_used}]. Signal: {result.get('signal', 'N/A')} | Confidence: {result.get('confidence', 'N/A')} | Score: {result.get('confluence_score', 'N/A')}/100. Reason: {summary_reason}", symbol=symbol, signal=result.get('signal'), score=result.get('confluence_score'))
-        
+        add_notification('info', f"🧠 **{symbol}**: AI analysis complete. Signal: {result.get('signal', 'N/A')} | Confidence: {result.get('confidence', 'N/A')} | Score: {result.get('confluence_score', 'N/A')}/100. Reason: {summary_reason}", symbol=symbol, signal=result.get('signal'), score=result.get('confluence_score'))
         if result.get('rejection_reason') == 'RATE_LIMIT':
             st.session_state.rate_limit_hit = True
             next_retry = st.session_state.gpt_rate_limit_until or (datetime.now() + timedelta(seconds=GROQ_MIN_REQUEST_INTERVAL))
@@ -4459,6 +4507,7 @@ if st.button("🔍 Run Macro Analysis Now", type="secondary", disabled=st.sessio
                     render_analysis_status(status_placeholder)
                     with st.spinner(f"Analyzing {symbol} with DXY Correlation..."):
                         result = analyze_symbol_premium(symbol, all_data, news_override=None)
+                        st.session_state.last_ai_analysis_time = datetime.now()
                     set_cached_analysis(symbol, result)
                     try:
                         process_symbol_result(result, symbol, is_auto=False, all_data=all_data)
@@ -4502,11 +4551,15 @@ if st.session_state.bot_running:
                 all_data = load_market_data(force_refresh=False)
                 for i, symbol in enumerate(selected_symbols):
                     next_pair = selected_symbols[i + 1] if i + 1 < len(selected_symbols) else None
-                    if st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited():
-                        add_notification('warning', '⏳ Rate limit reached. Using cached/fallback analysis for this symbol.', symbol=symbol)
+                    ai_due = is_ai_analysis_due()
+                    if st.session_state.get('rate_limit_hit', False) or is_gpt_rate_limited() or not ai_due:
+                        if not ai_due and not st.session_state.get('rate_limit_hit', False) and not is_gpt_rate_limited():
+                            add_notification('info', f"🐍 {symbol}: Python desk cycle (full Groq AI every {GROQ_AI_INTERVAL_MINUTES}m).", symbol=symbol)
+                        else:
+                            add_notification('warning', '⏳ Rate limit reached. Using cached/fallback analysis for this symbol.', symbol=symbol)
                         cached_result = get_cached_analysis(symbol)
                         result = cached_result if cached_result is not None else _local_fallback(symbol, all_data)
-                        update_analysis_status(symbol=symbol, message=f"Rate-limited: cached/fallback analysis for {symbol}", next_pair=next_pair)
+                        update_analysis_status(symbol=symbol, message=(f"Python desk cycle for {symbol}" if not ai_due else f"Rate-limited: cached/fallback analysis for {symbol}"), next_pair=next_pair)
                         render_analysis_status(status_placeholder)
                         try:
                             process_symbol_result(result, symbol, is_auto=True, all_data=all_data)
@@ -4516,6 +4569,7 @@ if st.session_state.bot_running:
                         update_analysis_status(symbol=symbol, message=f"Starting scheduled analysis for {symbol}", next_pair=next_pair)
                         render_analysis_status(status_placeholder)
                         result = analyze_symbol_premium(symbol, all_data, news_override=None)
+                        st.session_state.last_ai_analysis_time = datetime.now()
                         set_cached_analysis(symbol, result)
                         try:
                             process_symbol_result(result, symbol, is_auto=True, all_data=all_data)
@@ -4664,7 +4718,7 @@ with tab5:
     """)
     st.subheader("🎯 Quality Filters")
     st.info(f"""**Current Active Settings:**
-- AI Model: **llama-3.3-70b-versatile** (falls back to llama-3.1-8b-instant)
+- AI Model: **qwen/qwen3.6-27b** (falls back to none)
 - Minimum Confluence Score: **{MINIMUM_CONFLUENCE_SCORE}/100**
 - **Firm Desk Bias with Hysteresis:** HTF-first standing bias ({BIAS_MIN_HOLD_MINUTES}-min hold) prevents BUY↔SELL flip-flopping; flips require a real H1/H4 structural break with strong evidence.
 - **Cooldown:** a good setup is not re-signalled for **30 minutes**.
