@@ -3587,7 +3587,7 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
             analysis['confidence'] = 'LOW'
             analysis['confluence_score'] = min(analysis.get('confluence_score', 0), MINIMUM_CONFLUENCE_SCORE)
             analysis['rejection_reason'] = 'Exhaustion is already visible, so the market is too extended to justify forcing a fresh trade into the move.'
-        if setup_context['entry_timing'] == 'late':
+        if setup_context['entry_timing'] == 'late' and analysis.get('confluence_score', 0) > 0:
             analysis['signal'] = 'WAIT'
             analysis['confidence'] = 'LOW'
             analysis['confluence_score'] = min(analysis.get('confluence_score', 0), MINIMUM_CONFLUENCE_SCORE)
