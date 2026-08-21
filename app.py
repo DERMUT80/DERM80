@@ -1479,7 +1479,7 @@ OUTPUT JSON ONLY (NO MARKDOWN):
 
 MINIMUM_CONFLUENCE_SCORE = 70
 ANALYSIS_INTERVAL_MINUTES = 5
-GROQ_AI_INTERVAL_MINUTES = 15
+GROQ_AI_INTERVAL_MINUTES = 30
 PYTHON_FALLBACK_INTERVAL_MINUTES = 5
 NEWS_PRE_WINDOW_HOURS = 2
 
@@ -2292,10 +2292,10 @@ def run_news_analysis_cycle(event, all_data, symbols):
 
 # ── Groq / Rate Limits ────────────────────────────────────────────────────────
 GROQ_MIN_REQUEST_INTERVAL = 20
-GROQ_TOKEN_LIMIT_PER_MINUTE = 60000
-GROQ_TOKEN_LIMIT_PER_DAY = 500000
-GROQ_ESTIMATED_RESPONSE_TOKENS = 5000
-GROQ_IMAGE_TOKEN_ESTIMATE = 2000
+GROQ_TOKEN_LIMIT_PER_MINUTE = 8000
+GROQ_TOKEN_LIMIT_PER_DAY = 150000
+GROQ_ESTIMATED_RESPONSE_TOKENS = 1500
+GROQ_IMAGE_TOKEN_ESTIMATE = 1200
 GROQ_MODELS = ['qwen/qwen3.6-27b']
 
 def estimate_tokens_for_text(text):
@@ -2454,15 +2454,29 @@ def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estima
                 st.session_state.gpt_rate_limit_until = datetime.now() + timedelta(seconds=wait_time)
                 st.session_state.gpt_rate_limit_reason = f"Minimum request spacing not met. Wait {wait_time}s before the next Groq call."
                 return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "RATE_LIMIT", "rate_limit_reason": st.session_state.gpt_rate_limit_reason, "estimated_tokens": estimated_tokens}
-                # GROQ 8K TPM HARD LIMIT GUARD
-            if isinstance(user_content, list):
-                for item in user_content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text = item.get("text", "")
-                        if len(text) > 20000 and "PYTHON CANDIDATE EXECUTION PLANS" in text:
-                            import re as _re
-                            text = _re.sub(r'PYTHON CANDIDATE EXECUTION PLANS:.*?(?=ENTRY EXECUTION RULES:)', 'PYTHON CANDIDATE EXECUTION PLANS: [Removed to fit Groq 8k TPM limit]\n', text, flags=_re.DOTALL)
-                            item["text"] = text
+                # GROQ 8K TPM HARD LIMIT GUARD (AGGRESSIVE - fits within 8000 TPM)
+if isinstance(user_content, list):
+    for item in user_content:
+        if isinstance(item, dict) and item.get("type") == "text":
+            text = item.get("text", "")
+            import re as _re
+            # Always remove candidate plans (saves ~800 tokens)
+            if "PYTHON CANDIDATE EXECUTION PLANS:" in text:
+                text = _re.sub(r'PYTHON CANDIDATE EXECUTION PLANS:.*?(?=ENTRY EXECUTION RULES:)', 'PYTHON CANDIDATE EXECUTION PLANS: [Use structural levels from context]
+', text, flags=_re.DOTALL)
+            # If still too long, remove multitimeframe context (saves ~600 tokens)
+            if len(text) > 14000:
+                text = _re.sub(r'MULTI-TIMEFRAME CONTEXT \(10M/15M/30M/1H/4H\):.*?(?=RSI VALUES)', 'MULTI-TIMEFRAME CONTEXT: [Condensed - see structure data]
+', text, flags=_re.DOTALL)
+            # If still too long, remove RSI divergence details (saves ~400 tokens)
+            if len(text) > 12000:
+                text = _re.sub(r'RSI / DIVERGENCE CONTEXT:.*?(?=PREMIUM/DISCOUNT)', 'RSI / DIVERGENCE CONTEXT: [See RSI values above]
+', text, flags=_re.DOTALL)
+            # If still too long, remove market structure zones (saves ~300 tokens)
+            if len(text) > 10000:
+                text = _re.sub(r'MARKET STRUCTURE ZONES:.*?(?=MULTI-TIMEFRAME)', 'MARKET STRUCTURE ZONES: [See structure context]
+', text, flags=_re.DOTALL)
+            item["text"] = text
 
             payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}], "max_tokens": max_tokens, "temperature": 0.1}
             res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=90)
@@ -3553,7 +3567,7 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         # Use the full instruction template as the system prompt so the model treats
         # the news/market analysis rules as authoritative system-level behavior.
         estimated_tokens = estimate_analysis_tokens(prompt_template, user_content)
-        analysis = call_gpt("You are an elite institutional-style macro and execution analyst. Follow the instructions and data provided in the user message.", user_content, max_tokens=1500, estimated_tokens=estimated_tokens)
+        analysis = call_gpt("You are an elite institutional-style macro and execution analyst. Follow the instructions and data provided in the user message.", user_content, max_tokens=1000, estimated_tokens=estimated_tokens)
         # Refresh executable quote after AI latency before final level enforcement.
         _post_ai_snapshot = get_live_market_snapshot(symbol, YFINANCE_MAP.get(symbol, symbol), fallback_df=m10)
         if _post_ai_snapshot.get("price"):
@@ -4200,9 +4214,12 @@ def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estima
         sym = st.session_state.get("_snapshot_symbol")
         img = st.session_state.get("_snapshot_" + sym) if sym else None
         if img and isinstance(user_content, list):
-            has_img = any(isinstance(p, dict) and p.get("type") == "image_url" for p in user_content)
-            if not has_img:
-                user_content = user_content + [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}}]
+            # TOKEN GUARD: Only add image if text is small enough to fit both within 8000 TPM
+            text_len = sum(len(p.get("text", "")) for p in user_content if isinstance(p, dict) and p.get("type") == "text")
+            if text_len < 12000:  # Only add image if text is under ~3000 tokens
+                has_img = any(isinstance(p, dict) and p.get("type") == "image_url" for p in user_content)
+                if not has_img:
+                    user_content = user_content + [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + img}}]
             st.session_state.pop("_snapshot_symbol", None)
     except Exception:
         pass
