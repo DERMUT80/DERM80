@@ -2462,8 +2462,7 @@ if isinstance(user_content, list):
             import re as _re
             # Always remove candidate plans (saves ~800 tokens)
             if "PYTHON CANDIDATE EXECUTION PLANS:" in text:
-                text = _re.sub(r'PYTHON CANDIDATE EXECUTION PLANS:.*?(?=ENTRY EXECUTION RULES:)', 'PYTHON CANDIDATE EXECUTION PLANS: [Use structural levels from context]
-', text, flags=_re.DOTALL)
+                text = _re.sub(r'PYTHON CANDIDATE EXECUTION PLANS:.*?(?=ENTRY EXECUTION RULES:)', 'PYTHON CANDIDATE EXECUTION PLANS: [Use structural levels from context]\n', text, flags=_re.DOTALL)
             # If still too long, remove multitimeframe context (saves ~600 tokens)
             if len(text) > 14000:
                 text = _re.sub(r'MULTI-TIMEFRAME CONTEXT \(10M/15M/30M/1H/4H\):.*?(?=RSI VALUES)', 'MULTI-TIMEFRAME CONTEXT: [Condensed - see structure data]
