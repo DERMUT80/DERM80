@@ -373,7 +373,7 @@ def build_historical_context(m10):
     high = float(m10['High'].tail(20).max())
     low = float(m10['Low'].tail(20).min())
     range_pct = round(((high - low) / latest) * 100, 2) if latest else 0.0
-    return f"Last 20 closes: {closes}; latest 1-bar change: {change_pct}%; recent 20-bar range: {range_pct}%."
+    return f"Latest 1-bar change: {change_pct}%; recent 20-bar range: {range_pct}%. (Refer to the chart image for recent price action)."
 
 def compute_rsi_last(series, period=14):
     rsi = calculate_rsi(series, period)
@@ -2454,7 +2454,7 @@ def call_gpt(system_prompt, user_content, max_tokens=4000, retry_count=0, estima
                 st.session_state.gpt_rate_limit_until = datetime.now() + timedelta(seconds=wait_time)
                 st.session_state.gpt_rate_limit_reason = f"Minimum request spacing not met. Wait {wait_time}s before the next Groq call."
                 return {"signal": "WAIT", "confluence_score": 0, "confidence": "LOW", "rejection_reason": "RATE_LIMIT", "rate_limit_reason": st.session_state.gpt_rate_limit_reason, "estimated_tokens": estimated_tokens}
-            payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}], "max_tokens": max_tokens, "temperature": 0.1}
+            payload = {"model": model, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}], "max_tokens": max_tokens, "temperature": 0.1}, {"role": "user", "content": truncated_user_content}], "max_tokens": max_tokens, "temperature": 0.1}
             res = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=90)
             st.session_state.last_gpt_request_time = datetime.now()
             try:
@@ -4149,7 +4149,7 @@ def generate_market_snapshot_image(symbol, m10):
         df = m10.tail(60).copy()
         if df.empty:
             return None
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(6, 4))
         for i, (idx, row) in enumerate(df.iterrows()):
             o, h, l, c = row["Open"], row["High"], row["Low"], row["Close"]
             color = "#26a69a" if c >= o else "#ef5350"
@@ -4165,7 +4165,7 @@ def generate_market_snapshot_image(symbol, m10):
         ax.set_title("{} M10 market snapshot".format(symbol))
         ax.legend()
         buf = _io.BytesIO()
-        fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
+        fig.savefig(buf, format="png", dpi=72, bbox_inches="tight")
         plt.close(fig)
         return _b64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception:
