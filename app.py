@@ -3531,7 +3531,7 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
             'news_summary': news_text, 'structural_score_context': structural_score_context,
             'directional_ledger': directional_ledger, 'firm_bias': firm_bias_text,
             'max_entry_distance': max_entry_distance,
-            'candidate_levels': json.dumps(candidate_levels, indent=2, default=str),
+            'candidate_levels': json.dumps(candidate_levels, default=str),
         }
 
         try:
@@ -3543,7 +3543,7 @@ def analyze_symbol_premium(symbol, all_data, news_override=None):
         # Use the full instruction template as the system prompt so the model treats
         # the news/market analysis rules as authoritative system-level behavior.
         estimated_tokens = estimate_analysis_tokens(prompt_template, user_content)
-        analysis = call_gpt(prompt_template, user_content, max_tokens=4000, estimated_tokens=estimated_tokens)
+        analysis = call_gpt("You are an elite institutional-style macro and execution analyst. Follow the instructions and data provided in the user message.", user_content, max_tokens=1500, estimated_tokens=estimated_tokens)
         # Refresh executable quote after AI latency before final level enforcement.
         _post_ai_snapshot = get_live_market_snapshot(symbol, YFINANCE_MAP.get(symbol, symbol), fallback_df=m10)
         if _post_ai_snapshot.get("price"):
